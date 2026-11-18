@@ -758,4 +758,72 @@ def ask_scan():
         show_banner()
         console.print("  [bold bright_cyan]1.[/bold bright_cyan] 🎲  Random")
         console.print("  [bold bright_cyan]2.[/bold bright_cyan] 📈  Sequential\n")
-        console.print("  [bold bright_red]0.[/bold brig
+        console.print("  [bold bright_red]0.[/bold bright_red] ↩ Back\n")
+        c = Prompt.ask("  [bright_cyan]➜ Select[/bright_cyan]").strip()
+        if c == "0":
+            return None
+        if c in ("1", "2"):
+            return {"1": "random", "2": "sequential"}[c]
+
+def run():
+    global LICENSE_INFO
+    show_banner()
+
+    ok, msg = check_license()
+    while not ok:
+        clear_screen()
+        console.print(Panel(
+            Align.center(Text("🔐 Enter License Key (or 'q' to quit)",
+                              style="bold yellow")),
+            border_style="yellow"))
+        k = Prompt.ask("  ➜ Key").strip()
+        if k.lower() in ("q", "quit", "exit"):
+            console.print("[bold red]Cancelled.[/bold red]")
+            sys.exit(0)
+        if not k:
+            continue
+        ok2, m2 = activate_license(k)
+        console.print(Panel(
+            Align.center(Text(m2, style="bold green" if ok2 else "bold red")),
+            border_style="green" if ok2 else "red"))
+        time.sleep(2)
+        ok, msg = check_license()
+    LICENSE_INFO["status"] = msg
+
+    portal_url = detect_and_capture()
+    gw_params = build_gw_params(portal_url)
+
+    while True:
+        mode = ask_mode()
+        if mode is None:
+            break
+        length = ask_length(mode)
+        if length is None:
+            continue
+        scan_m = ask_scan()
+        if scan_m is None:
+            continue
+
+        try:
+            asyncio.run(scan_loop_async(mode, length, scan_m, gw_params))
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            console.print(f"[bold red]Error: {e}[/bold red]")
+            time.sleep(2)
+
+def main():
+    try: 
+        run()
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[bold red]Exiting...[/bold red]")
+    finally:
+        try:
+            console.print()
+            console.print(Text(f"✨ {APP_TAG} Tools ✨", style="bold bright_green"), justify="center")
+        except Exception: 
+            pass
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
