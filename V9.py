@@ -1,12 +1,12 @@
 # =====================================================================
-# khant_v9.py - KHANT V9 (FAST SESSION + REAL MAC/IP)
+# khant_v9.py - KHANT V9 (FIXED DASHBOARD + FAST SESSION)
 # PART 1
 # =====================================================================
 import os, time, random, string, json, asyncio, socket, threading, re, sys, uuid
 import urllib3, requests, aiohttp
 from collections import deque
 from urllib.parse import urlparse, parse_qs, quote, unquote
-from rich.console import Console
+from rich.console import Console, Group
 from rich.text import Text
 from rich.prompt import Prompt
 from rich.live import Live
@@ -14,7 +14,6 @@ from rich.panel import Panel
 from rich.box import ROUNDED
 from rich.table import Table
 from rich.align import Align
-from rich.layout import Layout
 
 try:
     import license as _license
@@ -279,12 +278,16 @@ def gen_code(mode, length, scan_method="random"):
                 return c
         return None
 
-# ---------- dashboard ----------
+# ---------- dashboard (FIXED) ----------
 def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
                 speed, mac, ip, sess_stat, sess_id, total):
     progress = min(100.0, (tested/total)*100) if total else 0.0
-    header = Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan", justify="center")
+    
+    # အပေါ်ဆုံး Title
+    header = Panel(Align.center(Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan")), 
+                   border_style="cyan", box=ROUNDED, height=3)
 
+    # အလယ်က အချက်အလက် ဇယား
     stat_style = "bold red" if any(x in status.upper() for x in ("ERR","TIMEOUT","BAN","EXHAUST", "FAIL", "CHECK")) else "bold green"
     sess_style = {"REAL":"bold green","EXPIRED":"bold red","BANNED":"bold red","HIT":"bold bright_green"}.get(sess_stat,"bold cyan")
     sess_txt = f"{sess_stat} ({(sess_id or '')[:8]})" if sess_id and sess_id != "--------" else sess_stat
@@ -298,17 +301,16 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     tbl.add_row("  🖥 MAC",      f": ...{mac[-8:]}",            "  🌐 IP",       f": ...{ip[-3:]}")
     tbl.add_row("  🔐 Session", f": {sess_txt}",               "  📈 Progress", f": {progress:.2f}%", style=sess_style)
 
-    # Screen နဲ့ ကိုက်ညီအောင် height ကို အနည်းဆုံးဖြစ်အောင် ချထားတယ်
-    tbl_panel = Panel(tbl, border_style="magenta", box=ROUNDED, height=7)
+    tbl_panel = Panel(tbl, border_style="magenta", box=ROUNDED, height=8)
     code_panel = Panel(Align.center(Text(f"Check Code : {cur_code or '------'}", style="bold yellow")),
                        border_style="yellow", box=ROUNDED, height=3)
 
     vt = Table(show_header=True, header_style="bold bright_white", expand=True, box=ROUNDED, border_style="green")
     vt.add_column("Voucher", style="bold green", justify="center")
-    vt.add_column("Real Plan (သက်တမ်း)", style="bold green", justify="center")
+    vt.add_column("Real Plan", style="bold green", justify="center")
     vt.add_column("Time", style="bold cyan", justify="center")
 
-    # Hits ကို ၅ ခုပဲ ပြမယ် (Screen ကျဉ်းလို့)
+    # Hits ကို ၅ ခုပဲ ပြမယ်
     for h in list(hits)[-5:]:
         vt.add_row(h.get('code',''), h.get('plan','N/A'), h.get('time',''))
     if not hits: vt.add_row("—","—","—")
@@ -316,19 +318,14 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     footer = Panel(Align.center(Text(f"✨ Thank You {APP_TAG} ✨", style="bold bright_yellow")),
                    border_style="red", box=ROUNDED, height=3)
 
-    body = Layout()
-    body.split_column(
-        Layout(tbl_panel, size=7),
-        Layout(code_panel, size=3),
-        Layout(vt, ratio=1),
-        Layout(footer, size=3),
+    # ⚠️ Layout မသုံးတော့ဘဲ Group နဲ့ တန်းစီပြမယ် (အပေါ်က လိုင်းတွေ မထွက်အောင်)
+    return Group(
+        header,
+        tbl_panel,
+        code_panel,
+        vt,
+        footer
     )
-    root = Layout()
-    root.split_column(
-        Layout(Panel(Align.center(header), border_style="cyan", box=ROUNDED), size=3),
-        Layout(body, ratio=1),
-    )
-    return root
 
 # ---------- scan loop ----------
 async def scan_loop_async(mode, length, scan_method, gw_params):
@@ -417,7 +414,6 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
 
                 async def _run(code):
                     async with sem:
-                        # Voucher စမ်းတဲ့အခါ အတု MAC/IP ကို ပြောင်းသုံးမယ်
                         temp_mac = generate_random_mac()
                         temp_ip = generate_random_ip()
                         return await test_code(session, sess, code, temp_mac, temp_ip)
