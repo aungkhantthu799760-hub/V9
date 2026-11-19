@@ -333,8 +333,8 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=1):
 
                 if status == 429:
                     errors.append(f"429@{base[-20:]}")
-                    await asyncio.sleep(0.6)
-                    continue
+                    await asyncio.sleep(3.5)
+                    return ("BAN", "429")
 
                 low = (body or "").lower()
                 if any(x in low for x in ("request limited", "too many",
@@ -549,7 +549,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     sess_lock = asyncio.Lock()
 
     fail_count = 0
-    ban_cooldown = 1.5
+    ban_cooldown = 5.0
 
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=100, ssl=False,
@@ -601,7 +601,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 set_state(sess_stat="REAL", sess_id=payload["sessionId"],
                           status="Active")
                 fail_count = 0
-                ban_cooldown = 1.5
+                ban_cooldown = 5.0
                 spare_sess = None
                 spare_task = asyncio.create_task(_fetch_one())
                 return True
@@ -611,7 +611,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 mac = generate_random_mac()
                 ip = generate_random_ip()
                 await asyncio.sleep(ban_cooldown)
-                ban_cooldown = min(ban_cooldown * 1.5, 8)
+                ban_cooldown = min(ban_cooldown * 1.5, 20)
                 spare_sess = None
                 spare_task = asyncio.create_task(_fetch_one())
                 return False
@@ -709,7 +709,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         mac = generate_random_mac()
                         ip = generate_random_ip()
                         await asyncio.sleep(ban_cooldown)
-                        ban_cooldown = min(ban_cooldown * 1.5, 8)
+                        ban_cooldown = min(ban_cooldown * 1.5, 20)
                         break
                     if res.startswith("__"):
                         continue
