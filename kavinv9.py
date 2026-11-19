@@ -1002,6 +1002,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
         except Exception:
             pass
 
+
 def show_banner():
     clear_screen()
     try:
@@ -1191,4 +1192,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
