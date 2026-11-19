@@ -1,5 +1,5 @@
 # =====================================================================
-# khant_v9.py - KHANT V9 (SMART SESSION ROTATION)
+# khant_v9.py - KHANT V9 (FULLY FIXED + FAKE SESSION + COMPACT UI)
 # PART 1
 # =====================================================================
 import os, time, random, string, json, asyncio, socket, threading, re, sys, uuid
@@ -25,7 +25,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HITS_FILE = "hits.txt"
-CONCURRENCY_LIMIT = 5
+CONCURRENCY_LIMIT = 5         # Ban မခံရအောင် ၅ ခုပဲ ထားတယ်
 TIMEOUT = 8
 SESSION_TTL = 240
 RUIJIE_BASE = "https://portal-as.ruijienetworks.com"
@@ -213,7 +213,6 @@ def build_gw_params(portal_url):
     else:
         p["url"] = RUIJIE_BASE
 
-    console.print(f"[cyan][+] Params: gw_id={p['gw_id']} nasip={p['nasip']} ssid={p['ssid']}[/cyan]")
     return p
 
 SESSION_PATTERNS = [
@@ -499,6 +498,8 @@ def gen_code(mode, length, scan_method="random"):
 def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
                 speed, mac, ip, sess_stat, sess_id, total):
     progress = min(100.0, (tested / total) * 100) if total else 0.0
+    
+    # Screen နဲ့ ကိုက်ညီအောင် အမြင့်တွေကို လျှော့ထားတယ်
     header = Panel(Align.center(Text(f"⚡ {APP_NAME} ⚡", style="bold bright_cyan")), border_style="cyan", box=ROUNDED, height=3)
     
     stat_style = "bold red" if any(x in status.upper() for x in ("ERR", "TIMEOUT", "BAN", "EXHAUST", "FAIL", "CHECK", "NO")) else "bold green"
