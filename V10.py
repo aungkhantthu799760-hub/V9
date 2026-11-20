@@ -129,6 +129,11 @@ def get_gateway_ip():
 
 
 def clear_screen():
+    try:
+        sys.stdout.write("\x1b[3J\x1b[2J\x1b[H")
+        sys.stdout.flush()
+    except Exception:
+        pass
     os.system("cls" if os.name == "nt" else "clear")
 
 
@@ -643,7 +648,7 @@ def render_dash(mode_str, scan_method, cur_code, tested, elapsed, status, hits,
     try:
         progress = min(100.0, (tested / total) * 100) if total else 0.0
         capped_speed = min(int(round(speed)), int(MAX_RATE_PER_MIN))
-        bar_len = 16
+        bar_len = 14
         filled = int(round((progress / 100.0) * bar_len))
         filled = max(0, min(bar_len, filled))
         bar = "█" * filled + "░" * (bar_len - filled)
@@ -869,7 +874,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             hits, 0.0, mac, ip, "HUNT_REAL", "waiting-real",
             total_target, 0, get_fake_count(),
         )
-        live = Live(init, refresh_per_second=2, console=console, transient=False)
+        live = Live(init, refresh_per_second=2, console=console, transient=True)
         live_holder["live"] = live
         try:
             live.start()
@@ -974,6 +979,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
         except (KeyboardInterrupt, asyncio.CancelledError):
             set_state(status="Stopped")
         finally:
+            live_holder["live"] = None
             timer.cancel()
             pool_task.cancel()
             for t in (timer, pool_task):
@@ -985,11 +991,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
                 live.stop()
             except Exception:
                 pass
-            try:
-                sys.stdout.write("\r\x1b[2K")
-                sys.stdout.flush()
-            except Exception:
-                pass
+            clear_screen()
 
         s = snap()
         try:
@@ -1007,6 +1009,7 @@ async def scan_loop_async(mode, length, scan_method, gw_params):
             )
             for hline in recent_hits_log:
                 console.print(f"[dim green]{hline}[/]")
+            await asyncio.sleep(1.5)
         except Exception:
             pass
 
@@ -1035,6 +1038,7 @@ def ask_mode():
             return None
         if c in ("1", "2", "3"):
             return {"1": "num", "2": "eng", "3": "mix"}[c]
+
 
 def ask_length(mode):
     lengths = (6, 7, 8, 9)
@@ -1163,4 +1167,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
